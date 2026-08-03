@@ -183,6 +183,9 @@ platform :ios do
   desc "Build a signed release and upload to TestFlight (internal testers only)."
   lane :beta_internal do
     key = api_key
+    # xcodegen-managed projects do not commit the .xcodeproj, so regenerate it
+    # before building or you build whatever stale file happens to be on disk.
+    sh("cd .. && xcodegen generate") if irk("USES_XCODEGEN", required: false).to_s == "true"
     build_number = timestamp_build
     gym(
       project: project,
