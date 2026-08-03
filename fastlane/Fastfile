@@ -464,4 +464,85 @@ platform :ios do
     builds = app.get_builds(limit: 10).reject(&:expired)
     UI.message("  #{builds.count} unexpired build(s): #{builds.map(&:version).join(', ')}")
   end
+
+  desc "Create the internal TestFlight group and add a tester. TESTER_EMAIL= overrides IRK_CONTACT_EMAIL"
+  lane :setup_internal do
+    require "net/http"
+    require "json"
+    connect!
+    token = Spaceship::ConnectAPI.token
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    email = ENV["TESTER_EMAIL"] || contact_email
+    UI.user_error!("Set TESTER_EMAIL or IRK_CONTACT_EMAIL") if email.to_s.empty?
+
+    internal = app.get_beta_groups.find(&:is_internal_group)
+    if internal.nil?
+      # fastlane's create_beta_group always sends publicLinkLimit, which internal
+      # groups reject outright, so POST a clean body ourselves.
+      uri = URI("https://api.appstoreconnect.apple.com/v1/betaGroups")
+      body = { data: { type: "betaGroups",
+        attributes: { name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true },
+        relationships: { app: { data: { id: app.id, type: "apps" } } } } }
+      req = Net::HTTP::Post.new(uri)
+      req["Authorization"] = "Bearer #{token.text}"
+      req["Content-Type"] = "application/json"
+      req.body = body.to_json
+      res = Net::HTTP.start(uri.host, 443, use_ssl: true) { |h| h.request(req) }
+      UI.user_error!("Group create failed: #{res.code} #{res.body}") unless res.code.to_i.between?(200, 299)
+      internal = Spaceship::ConnectAPI::App.find(app_id).get_beta_groups.find(&:is_internal_group)
+      UI.success("Created internal group 'Internal Testers'")
+    end
+
+    tester = (internal.get_beta_testers.find { |t| t.email&.casecmp?(email) } rescue nil)
+    if tester
+      UI.success("#{email} is already an internal tester.")
+    else
+      Spaceship::ConnectAPI.post_beta_tester_assignment(
+        beta_group_ids: [internal.id],
+        attributes: { email: email, firstName: contact_first.to_s, lastName: contact_last.to_s }
+      )
+      UI.success("Added #{email} as an internal tester.")
+    end
+  end
+
+  desc "Processing and TestFlight state of recent builds."
+  lane :build_status do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    builds = app.get_builds(includes: "preReleaseVersion,buildBetaDetail", limit: 5)
+    UI.important("No builds visible yet for #{app_id}.") if builds.empty?
+    builds.each do |b|
+      d = b.build_beta_detail
+      UI.message("build #{b.version}  processing=#{b.processing_state}  " \
+                 "internal=#{d&.internal_build_state}  external=#{d&.external_build_state}")
+    end
+  end
+
+  desc "Stage support URL + App Review contact details on the editable version."
+  # Deliberately does NOT submit. Staging and submitting are separate lanes so a
+  # metadata fix can never accidentally push a build into review.
+  lane :stage do
+    api_key
+    UI.user_error!("Set IRK_CONTACT_PHONE (Apple requires a review contact phone)") if contact_phone.to_s.empty?
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version
+    UI.user_error!("No editable version") if v.nil?
+
+    support_file = "fastlane/metadata/en-US/support_url.txt"
+    if File.exist?(support_file)
+      support = File.read(support_file).strip
+      v.get_app_store_version_localizations.each { |loc| loc.update(attributes: { supportUrl: support }) }
+    end
+
+    notes_file = "fastlane/metadata/review_notes.txt"
+    review_attrs = {
+      contactFirstName: contact_first, contactLastName: contact_last,
+      contactPhone: contact_phone, contactEmail: contact_email,
+      demoAccountRequired: false,
+      notes: (File.exist?(notes_file) ? File.read(notes_file) : "")
+    }
+    d = (v.fetch_app_store_review_detail rescue nil)
+    d ? d.update(attributes: review_attrs) : v.create_app_store_review_detail(attributes: review_attrs)
+    UI.success("Staged support URL and review info. Submission is a separate lane.")
+  end
 end
