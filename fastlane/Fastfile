@@ -1,0 +1,467 @@
+# ios-release-kit — shared App Store release lanes.
+#
+# Consumed by an app's own Fastfile:
+#
+#   opt_out_usage
+#   default_platform(:ios)
+#   ENV["IRK_APP_ID"]  ||= "com.acme.app"
+#   ENV["IRK_PROJECT"] ||= "Acme.xcodeproj"
+#   ENV["IRK_SCHEME"]  ||= "Acme"
+#   ENV["IRK_TEAM_ID"] ||= "XXXXXXXXXX"
+#   import_from_git(url: "https://github.com/Bkessing/ios-release-kit")
+#
+# Auth is an App Store Connect API key, env-driven via the app's fastlane/.env:
+#   ASC_KEY_ID, ASC_ISSUER_ID, optionally ASC_KEY_FILEPATH
+#   (defaults to ~/.appstoreconnect/private_keys/AuthKey_<ASC_KEY_ID>.p8)
+#
+# Every lane here was extracted from three shipped apps. The comments explaining
+# WHY a lane is shaped the way it is are the point — each one encodes a specific
+# failure that cost real days.
+
+opt_out_usage
+default_platform(:ios)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+# Read config from the environment rather than Ruby constants. `import_from_git`
+# evaluates this file in its own context, so constants defined in the consuming
+# Fastfile are not reliably visible here; ENV always is.
+def irk(key, required: true, default: nil)
+  value = ENV["IRK_#{key}"] || default
+  if required && value.to_s.strip.empty?
+    UI.user_error!(
+      "IRK_#{key} is not set. Add it to your Fastfile before import_from_git:\n" \
+      "  ENV[\"IRK_#{key}\"] ||= \"...\""
+    )
+  end
+  value
+end
+
+def app_id
+  irk("APP_ID")
+end
+def project
+  irk("PROJECT")
+end
+def scheme
+  irk("SCHEME")
+end
+def team_id
+  irk("TEAM_ID")
+end
+def app_name
+  irk("APP_NAME", required: false, default: scheme)
+end
+def export_profile
+  irk("EXPORT_PROFILE", required: false)
+end
+
+# Review contact. Apple requires these on submission; there is no sane default.
+def contact_first
+  irk("CONTACT_FIRST", required: false)
+end
+def contact_last
+  irk("CONTACT_LAST",  required: false)
+end
+def contact_email
+  irk("CONTACT_EMAIL", required: false)
+end
+def contact_phone
+  irk("CONTACT_PHONE", required: false)
+end
+
+def key_path
+  ENV["ASC_KEY_FILEPATH"] ||
+    File.expand_path("~/.appstoreconnect/private_keys/AuthKey_#{ENV.fetch('ASC_KEY_ID')}.p8")
+end
+
+def api_key
+  UI.user_error!("API key not found at #{key_path} — check fastlane/.env") unless File.exist?(key_path)
+  app_store_connect_api_key(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    key_filepath: key_path
+  )
+end
+
+def connect!
+  Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    filepath: key_path
+  )
+end
+
+def signing_xcargs
+  # gym injects the API-key auth flags itself from app_store_connect_api_key.
+  # Passing them again makes xcodebuild fail with
+  # "-authenticationKeyID may only be provided once".
+  "-allowProvisioningUpdates"
+end
+
+# Export with MANUAL signing and a named profile.
+#
+# Automatic signing at the export step requires an Apple ID signed into Xcode.
+# A headless or agent-driven run has none, and it fails as:
+#
+#     exportArchive No Accounts
+#     exportArchive No profiles for '<bundle>' were found
+#
+# The second line is a lie by omission — the profile is not missing, automatic
+# signing simply cannot authenticate to resolve one. Naming it removes both the
+# lookup and the account dependency.
+def export_options
+  profile = export_profile
+  return nil if profile.to_s.strip.empty?
+  {
+    signingStyle: "manual",
+    teamID: team_id,
+    signingCertificate: "Apple Distribution",
+    provisioningProfiles: { app_id => profile }
+  }
+end
+
+def timestamp_build
+  Time.now.strftime("%Y%m%d%H%M")
+end
+
+platform :ios do
+
+  # -------------------------------------------------------------------------
+  # Connection + account
+  # -------------------------------------------------------------------------
+
+  desc "Prove the App Store Connect connection by listing the team's apps."
+  lane :verify do
+    connect!
+    apps = Spaceship::ConnectAPI::App.all
+    UI.success("Connected. #{apps.count} app(s) on this team:")
+    apps.each { |a| UI.message("  #{a.id}  #{a.name}  #{a.bundle_id}") }
+  end
+
+  desc "Register the bundle id, and report whether the app record exists."
+  lane :create_app do
+    connect!
+    bundle = Spaceship::ConnectAPI::BundleId.all.find { |b| b.identifier == app_id }
+    if bundle.nil?
+      Spaceship::ConnectAPI::BundleId.create(
+        name: app_name.gsub(/[^0-9A-Za-z ]/, "").strip, identifier: app_id, platform: "IOS"
+      )
+      UI.success("Registered bundle id #{app_id}")
+    else
+      UI.message("Bundle id #{app_id} already registered")
+    end
+
+    # Apple's API has no CREATE on the apps resource, so the app record itself
+    # is the one irreducibly manual step in the whole pipeline.
+    existing = (Spaceship::ConnectAPI::App.find(app_id) rescue nil)
+    if existing
+      UI.success("App exists: #{existing.name} (#{app_id})")
+    else
+      UI.important("Bundle id registered, but the app record must be created once by hand:")
+      UI.message("  https://appstoreconnect.apple.com/apps -> + -> New App")
+      UI.message("  Bundle ID: #{app_id}  Name: #{app_name}")
+    end
+  end
+
+  desc "Create the Apple Distribution certificate if the account has none."
+  # Release export needs a DISTRIBUTION identity. Accounts lose them — revoked
+  # by a teammate, cleared by tooling, or simply never created on this Mac.
+  # A missing one reports as "exportArchive No Accounts", which reads like an
+  # Xcode sign-in problem and sends you looking in the wrong place entirely.
+  lane :signing_cert do
+    cert(api_key: api_key, development: false, output_path: "/tmp/#{scheme}-certs")
+    UI.success("Distribution certificate ready.")
+  end
+
+  # -------------------------------------------------------------------------
+  # Build + upload
+  # -------------------------------------------------------------------------
+
+  desc "Build a signed release and upload to TestFlight (internal testers only)."
+  lane :beta_internal do
+    key = api_key
+    build_number = timestamp_build
+    gym(
+      project: project,
+      scheme: scheme,
+      configuration: "Release",
+      destination: "generic/platform=iOS",
+      export_method: "app-store",
+      output_directory: "/tmp/#{scheme.downcase}-fastlane",
+      # Outside any iCloud-synced directory: codesign chokes on the extended
+      # attributes iCloud adds to files under ~/Documents.
+      derived_data_path: "/tmp/#{scheme.downcase}-dd-release",
+      xcargs: "#{signing_xcargs} CURRENT_PROJECT_VERSION=#{build_number}",
+      export_xcargs: signing_xcargs,
+      export_options: export_options
+    )
+    # No distribute_external: no Beta App Review, no ~24h wait. Internal testers
+    # receive every uploaded build once processing finishes.
+    pilot(
+      api_key: key,
+      app_identifier: app_id,
+      distribute_external: false,
+      skip_waiting_for_build_processing: true,
+      changelog: ENV["CHANGELOG"] || "Internal build."
+    )
+    UI.success("Uploaded build #{build_number} to TestFlight (internal).")
+  end
+
+  desc "Distribute an already-uploaded build to external testers."
+  lane :public_beta do
+    UI.user_error!("Set IRK_CONTACT_PHONE (Apple requires a review contact phone)") if contact_phone.to_s.empty?
+    pilot(
+      api_key: api_key,
+      app_identifier: app_id,
+      distribute_external: true,
+      distribute_only: true,   # distribute what is already uploaded; do not rebuild
+      groups: (ENV["IRK_EXTERNAL_GROUPS"] || "Public Beta").split(","),
+      notify_external_testers: true,
+      changelog: ENV["CHANGELOG"] || "New build.",
+      beta_app_review_info: {
+        contact_first_name: contact_first,
+        contact_last_name: contact_last,
+        contact_email: contact_email,
+        contact_phone: contact_phone,
+        demo_account_required: false
+      }
+    )
+  end
+
+  # -------------------------------------------------------------------------
+  # Version + submission
+  # -------------------------------------------------------------------------
+
+  desc "Create (or reuse) an editable App Store version and set What's New. VERSION= WHATS_NEW="
+  lane :new_version do
+    api_key
+    version = ENV["VERSION"] or UI.user_error!("Set VERSION=1.2.3")
+    whats_new = ENV["WHATS_NEW"] || "Bug fixes and improvements."
+    app = Spaceship::ConnectAPI::App.find(app_id)
+
+    v = app.get_edit_app_store_version
+    if v.nil?
+      v = Spaceship::ConnectAPI.post_app_store_version(
+        app_id: app.id, attributes: { versionString: version, platform: "IOS" }
+      ).to_models.first
+      UI.success("Created version #{v.version_string}")
+    else
+      UI.important("Editable version already exists: #{v.version_string} (#{v.app_store_state}) — reusing")
+    end
+
+    locs = v.get_app_store_version_localizations
+    en = locs.find { |l| l.locale == "en-US" } || locs.first
+    if en
+      en.update(attributes: { whatsNew: whats_new })
+    else
+      Spaceship::ConnectAPI.post_app_store_version_localization(
+        app_store_version_id: v.id, attributes: { locale: "en-US", whatsNew: whats_new }
+      )
+    end
+    UI.success("new_version done: #{v.version_string} (#{v.app_store_state})")
+  end
+
+  desc "Attach an uploaded build to the editable version. BUILD=<build number>"
+  lane :attach_build do
+    api_key
+    build_number = ENV["BUILD"] or UI.user_error!("Set BUILD=<build number>")
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version or UI.user_error!("No editable version — run new_version first")
+    build = app.get_builds(filter: { version: build_number }).first
+    UI.user_error!("Build #{build_number} not found") if build.nil?
+    v.select_build(build_id: build.id)
+    UI.success("Attached build #{build_number} to version #{v.version_string}")
+  end
+
+  desc "Set release type. RELEASE_TYPE=AFTER_APPROVAL|MANUAL|SCHEDULED"
+  lane :set_release_type do
+    api_key
+    rt = ENV["RELEASE_TYPE"] || "AFTER_APPROVAL"
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version ||
+        app.get_app_store_versions.find { |x|
+          %w[PREPARE_FOR_SUBMISSION WAITING_FOR_REVIEW IN_REVIEW PENDING_DEVELOPER_RELEASE]
+            .include?(x.app_store_state)
+        }
+    UI.user_error!("No pending version found") if v.nil?
+    Spaceship::ConnectAPI.patch_app_store_version(
+      app_store_version_id: v.id, attributes: { releaseType: rt }
+    )
+    UI.success("releaseType=#{rt} on #{v.version_string}")
+  end
+
+  desc "Submit the editable version for review."
+  lane :submit do
+    key = api_key
+    deliver(
+      api_key: key,
+      app_identifier: app_id,
+      submit_for_review: true,
+      automatic_release: false,
+      force: true,
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      skip_metadata: true,
+      precheck_include_in_app_purchases: false
+    )
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_app_store_versions.first
+    UI.success("Submitted #{v&.version_string} — state #{v&.app_store_state}")
+  end
+
+  desc "Cancel a stuck submission and resubmit with a fresh build. BUILD=<build number>"
+  # Cancelling does not release the version immediately: Apple takes time to
+  # move it out of the review queue, and attaching during that window fails.
+  # Retry rather than assuming the first attempt works.
+  lane :resubmit do
+    api_key
+    build_number = ENV["BUILD"] or UI.user_error!("Set BUILD=<build number>")
+    app = Spaceship::ConnectAPI::App.find(app_id)
+
+    submission = app.get_review_submissions(filter: { state: "WAITING_FOR_REVIEW,IN_REVIEW" }).first
+    if submission
+      submission.cancel_submission
+      UI.important("Cancelled submission #{submission.id}; waiting for the version to free up")
+    end
+
+    v = nil
+    6.times do |attempt|
+      v = app.get_edit_app_store_version
+      break if v
+      UI.message("  version not editable yet (attempt #{attempt + 1}/6)")
+      sleep(10)
+    end
+    UI.user_error!("Version never became editable after cancelling") if v.nil?
+
+    build = app.get_builds(filter: { version: build_number }).first
+    UI.user_error!("Build #{build_number} not found") if build.nil?
+    v.select_build(build_id: build.id)
+    UI.success("Reattached build #{build_number}. Run `submit` when ready.")
+  end
+
+  # -------------------------------------------------------------------------
+  # Assets + metadata
+  # -------------------------------------------------------------------------
+
+  desc "Replace BOTH iPhone screenshot sets. IRK_SHOTS_DIR=<dir with 65/ subdir>"
+  # The previous version of this lane wrote only APP_IPHONE_65. That is the
+  # SECONDARY set: APP_IPHONE_67 (6.9in) is what modern iPhones render in search
+  # results, so updating one silently left the other serving stale artwork to
+  # most traffic. Always write both, and fail loudly rather than half-updating.
+  lane :upload_shots do
+    api_key
+    dir = irk("SHOTS_DIR")
+    names = (ENV["IRK_SHOT_NAMES"] || "").split(",").map(&:strip).reject(&:empty?)
+    names = Dir.glob(File.join(dir, "*.png")).sort.map { |f| File.basename(f) } if names.empty?
+    UI.user_error!("No screenshots found in #{dir}") if names.empty?
+
+    targets = {
+      "APP_IPHONE_67" => [dir, "1290x2796"],
+      "APP_IPHONE_65" => [File.join(dir, "65"), "1284x2778"],
+    }
+
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version or UI.user_error!("No editable version — run new_version first")
+    loc = v.get_app_store_version_localizations.find { |l| l.locale == "en-US" }
+    UI.user_error!("no en-US localization") if loc.nil?
+
+    targets.each do |display_type, (src, expected)|
+      files = names.map { |f| File.join(src, f) }
+      next UI.important("skipping #{display_type}: #{src} not present") unless files.all? { |f| File.exist?(f) }
+
+      files.each do |f|
+        # PNG IHDR: width and height are big-endian uint32 at offsets 16 and 20.
+        # Read them directly so the guard has no external dependency.
+        w, h = File.binread(f, 8, 16).unpack("N2")
+        UI.user_error!("#{File.basename(f)} is #{w}x#{h}, expected #{expected} for #{display_type}") if "#{w}x#{h}" != expected
+      end
+
+      set = loc.get_app_screenshot_sets.find { |x| x.screenshot_display_type == display_type }
+      if set.nil?
+        set = Spaceship::ConnectAPI.post_app_screenshot_set(
+          app_store_version_localization_id: loc.id,
+          attributes: { screenshotDisplayType: display_type }
+        ).to_models.first
+      else
+        set.app_screenshots.each(&:delete!)
+      end
+      files.each { |f| set.upload_screenshot(path: f, wait_for_processing: true) }
+      UI.success("#{display_type}: #{files.length} screenshots")
+    end
+  end
+
+  desc "Pull the live ASC listing into fastlane/metadata/ as the source of truth."
+  lane :pull_metadata do
+    require "fileutils"
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    dir = File.expand_path("metadata/en-US", __dir__)
+    FileUtils.mkdir_p(dir)
+
+    info = (app.fetch_edit_app_info rescue nil) || (app.fetch_live_app_info rescue nil)
+    info&.get_app_info_localizations&.each do |l|
+      next unless l.locale == "en-US"
+      File.write(File.join(dir, "name.txt"), l.name.to_s)
+      File.write(File.join(dir, "subtitle.txt"), l.subtitle.to_s)
+    end
+
+    v = app.get_edit_app_store_version || app.get_live_app_store_version
+    UI.user_error!("No App Store version found") if v.nil?
+    v.get_app_store_version_localizations.each do |loc|
+      next unless loc.locale == "en-US"
+      {
+        "description.txt" => loc.description, "keywords.txt" => loc.keywords,
+        "promotional_text.txt" => loc.promotional_text, "release_notes.txt" => loc.whats_new,
+        "support_url.txt" => loc.support_url, "marketing_url.txt" => loc.marketing_url
+      }.each { |f, val| File.write(File.join(dir, f), val.to_s) }
+    end
+    UI.success("Wrote listing to fastlane/metadata/en-US/ — commit it.")
+  end
+
+  desc "Push fastlane/metadata/ to the editable version. Submits nothing."
+  lane :push_metadata do
+    deliver(
+      api_key: api_key,
+      app_identifier: app_id,
+      metadata_path: "fastlane/metadata",
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      force: true,
+      run_precheck_before_submit: false,
+      submit_for_review: false
+    )
+    UI.success("Metadata pushed. Nothing submitted.")
+  end
+
+  # -------------------------------------------------------------------------
+  # Status
+  # -------------------------------------------------------------------------
+
+  desc "Version states, attached build, and the current review submission."
+  lane :release_status do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    app.get_app_store_versions(limit: 5).each do |v|
+      build = (v.get_build rescue nil)
+      UI.message("  #{v.version_string.to_s.ljust(8)} #{v.app_store_state.to_s.ljust(26)} " \
+                 "release=#{v.release_type} build=#{build&.version || '-'}")
+    end
+    app.get_review_submissions(limit: 3).each do |s|
+      UI.message("  submission state=#{s.state} submitted=#{s.submitted_date}")
+    end
+  end
+
+  desc "TestFlight groups, testers, and unexpired builds."
+  lane :tf_state do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    app.get_beta_groups.each do |g|
+      UI.message("  GROUP '#{g.name}' internal=#{g.is_internal_group}")
+    end
+    builds = app.get_builds(limit: 10).reject(&:expired)
+    UI.message("  #{builds.count} unexpired build(s): #{builds.map(&:version).join(', ')}")
+  end
+end
