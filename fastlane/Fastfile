@@ -163,6 +163,25 @@ platform :ios do
     apps = Spaceship::ConnectAPI::App.all
     UI.success("Connected. #{apps.count} app(s) on this team:")
     apps.each { |a| UI.message("  #{a.id}  #{a.name}  #{a.bundle_id}") }
+
+    # Print IRK_TEAM_ID too, because it is the one config value the API key does
+    # not carry and a first-timer would otherwise have to go hunting for it in
+    # the developer portal. Every signing identity embeds it as the OU of its
+    # certificate, so read it off the machine rather than sending them looking.
+    ids = `security find-identity -v -p codesigning 2>/dev/null`
+    found = ids.scan(/"((?:[^"]*?) \(([A-Z0-9]{10})\))"/).map { |full, id| [id, full] }.uniq(&:first)
+    if found.empty?
+      UI.important("Team ID: no signing identity on this Mac yet — run signing_cert, " \
+                   "or read it from developer.apple.com > Membership details.")
+    elsif found.one?
+      UI.message("  Team ID: #{found.first[0]}   <- IRK_TEAM_ID")
+    else
+      # More than one Apple account has signed on this Mac. Guessing would set up
+      # a build that fails much later with a confusing profile error, so name
+      # them and let the human pick.
+      UI.important("More than one team on this Mac. IRK_TEAM_ID is the one that owns the app:")
+      found.each { |id, name| UI.message("  #{id}   #{name}") }
+    end
   end
 
   desc "Register the bundle id, and report whether the app record exists."

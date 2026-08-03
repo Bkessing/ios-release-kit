@@ -8,6 +8,30 @@ Extracted from three shipped apps. The comments explaining *why* each lane is
 shaped the way it is are the point — most of them encode a specific failure that
 cost a real day.
 
+## Never shipped an app before?
+
+Use it through [Claude Code](https://claude.com/claude-code) and let it drive.
+Copy the skill in, then say what you want:
+
+```bash
+git clone https://github.com/Bkessing/ios-release-kit
+mkdir -p ~/.claude/skills
+cp -R ios-release-kit/skills/ios-release-kit ~/.claude/skills/
+```
+
+Then: *"get my app onto TestFlight"*.
+
+It works out which of the steps below are already done, does the automatable
+ones, and walks you through the ones Apple insists a human do — creating the App
+Store Connect API key, the app record, the age rating — one at a time, checking
+each landed before moving on. It will not read you a twelve-step checklist.
+
+Worth knowing up front: the Apple Developer Program is **$99/year** and there is
+no free route to TestFlight or the App Store.
+
+Pair it with [appstore-doctor](https://github.com/Bkessing/appstore-doctor) for
+diagnosis when something fails. This repo does; that one reads.
+
 ## Use it
 
 In your app's `fastlane/Fastfile`:
@@ -61,6 +85,7 @@ surfacing later as a confusing Apple error.
 | `verify` | prove the API connection, list the team's apps |
 | `create_app` | register the bundle id, report whether the app record exists |
 | `signing_cert` | create the Apple Distribution certificate |
+| `setup_internal` | create the internal TestFlight group and add a tester |
 
 **Build and upload**
 
@@ -86,6 +111,9 @@ surfacing later as a confusing Apple error.
 | `upload_shots` | replace **both** iPhone screenshot sets, with size validation |
 | `pull_metadata` | pull the live listing into `fastlane/metadata/` |
 | `push_metadata` | push it back. Submits nothing |
+| `stage` | support URL + App Review contact details |
+| `set_privacy_policy` | privacy policy URL on every locale |
+| `open_territories` | make the app available in every territory |
 
 **Status**
 
@@ -93,6 +121,8 @@ surfacing later as a confusing Apple error.
 |---|---|
 | `release_status` | version states, attached builds, review submissions |
 | `tf_state` | TestFlight groups and unexpired builds |
+| `build_status` | processing and TestFlight state of recent uploads |
+| `asc_check` | pre-submission guard: version state, screenshots, 3.1.2 metadata |
 
 ## The failures these encode
 
@@ -114,6 +144,18 @@ that window fails. `resubmit` retries rather than assuming.
 
 **DerivedData outside `~/Documents`.** codesign chokes on the extended
 attributes iCloud adds to synced files, so builds go to `/tmp`.
+
+**Approved and selling nowhere.** An app can sit at `READY_FOR_SALE`, fully
+approved, and be purchasable in zero storefronts because the availability record
+was never created. Nothing warns you; a 404 is the only signal. `open_territories`
+creates it. Reading an existing one has to follow Apple's own relationship link —
+asking for `territoryAvailabilities` under `/v1/` returns a path error that reads
+exactly like "no territories" when the app has all of them.
+
+**The privacy policy is not where you think.** It lives on `appInfoLocalizations`,
+while the support URL and review contact live on the version localizations. A
+fully staged version can still be missing it, and Apple blocks submission on it.
+That is why `set_privacy_policy` is a separate lane from `stage`.
 
 **The app record is the one manual step.** Apple's API has no CREATE on the apps
 resource. `create_app` registers the bundle id and tells you exactly what to
