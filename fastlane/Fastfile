@@ -127,6 +127,30 @@ def timestamp_build
   Time.now.strftime("%Y%m%d%H%M")
 end
 
+# Raw App Store Connect request.
+#
+# Spaceship's request clients are pinned to the v1 base path, and two of the
+# resources below only exist under v2. Rather than fight that, sign a request by
+# hand with the same token Spaceship already holds. `path` must include the
+# version segment (e.g. "/v2/appAvailabilities").
+def asc_http(method, path, body = nil)
+  require "net/http"
+  require "json"
+  connect!
+  uri = URI("https://api.appstoreconnect.apple.com#{path}")
+  klass = { get: Net::HTTP::Get, post: Net::HTTP::Post, patch: Net::HTTP::Patch }.fetch(method)
+  req = klass.new(uri)
+  req["Authorization"] = "Bearer #{Spaceship::ConnectAPI.token.text}"
+  req["Content-Type"] = "application/json"
+  req.body = JSON.generate(body) if body
+  res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+  parsed = (res.body.to_s.empty? ? {} : JSON.parse(res.body))
+  unless res.code.to_i.between?(200, 299)
+    UI.user_error!("ASC #{method.to_s.upcase} #{path} -> #{res.code}\n#{res.body}")
+  end
+  parsed
+end
+
 platform :ios do
 
   # -------------------------------------------------------------------------
@@ -547,6 +571,92 @@ platform :ios do
     d = (v.fetch_app_store_review_detail rescue nil)
     d ? d.update(attributes: review_attrs) : v.create_app_store_review_detail(attributes: review_attrs)
     UI.success("Staged support URL and review info. Submission is a separate lane.")
+  end
+
+  desc "Set the privacy policy URL on every locale. URL= overrides IRK_PRIVACY_URL"
+  # Separate from `stage` on purpose: the privacy policy lives on
+  # appInfoLocalizations, NOT on the version localizations `stage` writes. They
+  # are different resources on different parents, so a version that has been
+  # fully staged can still be missing this, and Apple blocks submission on it.
+  lane :set_privacy_policy do |options|
+    url = (options[:url] || ENV["URL"] || irk("PRIVACY_URL", required: false)).to_s.strip
+    UI.user_error!("Pass URL=https://... or set IRK_PRIVACY_URL") if url.empty?
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    info = asc_http(:get, "/v1/apps/#{app.id}/appInfos?limit=5")["data"].first
+    UI.user_error!("No appInfo for #{app_id}") if info.nil?
+    locs = asc_http(:get, "/v1/appInfos/#{info['id']}/appInfoLocalizations?limit=50")["data"]
+    locs.each do |loc|
+      current = loc["attributes"]["privacyPolicyUrl"].to_s.strip
+      if current == url
+        UI.message("#{loc['attributes']['locale']}: already #{url}")
+        next
+      end
+      asc_http(:patch, "/v1/appInfoLocalizations/#{loc['id']}", {
+        "data" => { "type" => "appInfoLocalizations", "id" => loc["id"],
+                    "attributes" => { "privacyPolicyUrl" => url } }
+      })
+      UI.success("#{loc['attributes']['locale']}: set -> #{url}")
+    end
+  end
+
+  desc "Make the app available in every App Store territory. Creates the record if absent."
+  # The quietest landmine in the whole pipeline: an app can sit at
+  # READY_FOR_SALE, fully approved, and be purchasable in ZERO storefronts
+  # because this resource was never created. Nothing in App Store Connect warns
+  # you; a 404 on appAvailabilityV2 is the only signal, which is exactly what
+  # appstore-doctor's listing check looks for.
+  #
+  # Creation is all-or-nothing: there is no PATCH to add territories to an
+  # existing record through this endpoint, so the lane refuses rather than
+  # pretending it changed something.
+  lane :open_territories do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+
+    existing = begin
+      asc_http(:get, "/v1/apps/#{app.id}/appAvailabilityV2")
+    rescue FastlaneCore::Interface::FastlaneError
+      nil
+    end
+    if existing && existing["data"]
+      # Follow Apple's OWN relationship link. The v1 path for this relationship
+      # does not exist -- asking for it returns a PATH_ERROR that reads like the
+      # app has no territories, when it has all of them.
+      link = existing.dig("data", "relationships", "territoryAvailabilities", "links", "related")
+      count = 0
+      page = "#{link}?limit=200"
+      while page
+        body = asc_http(:get, page.sub("https://api.appstoreconnect.apple.com", ""))
+        count += body["data"].count { |t| t["attributes"]["available"] }
+        page = body.dig("links", "next")
+      end
+      UI.success("Availability already exists: #{count} territories. Nothing to do.")
+      next
+    end
+
+    territories = []
+    page = "/v1/territories?limit=200"
+    while page
+      body = asc_http(:get, page.sub("https://api.appstoreconnect.apple.com", ""))
+      territories += body["data"].map { |t| t["id"] }
+      page = body.dig("links", "next")
+    end
+    UI.message("Creating availability across #{territories.count} territories")
+
+    asc_http(:post, "/v2/appAvailabilities", {
+      "data" => {
+        "type" => "appAvailabilities",
+        "attributes" => { "availableInNewTerritories" => true },
+        "relationships" => {
+          "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } },
+          "territoryAvailabilities" => {
+            "data" => territories.map { |id| { "type" => "territoryAvailabilities", "id" => id } }
+          }
+        }
+      }
+    })
+    UI.success("Availability created across #{territories.count} territories.")
   end
 
   desc "Pre-submission guard: version state, screenshots, and Guideline 3.1.2 metadata. STRICT=1 to fail."
