@@ -107,5 +107,34 @@ These lanes write to a live App Store Connect account. `submit` and
 your app in front of Apple or real testers — **confirm before running either**,
 even if the user asked for "the whole thing". Everything else is safe to run.
 
-For diagnosing a failure rather than performing a step, use the companion
-`appstore-doctor` skill; it is read-only and will not touch the account.
+## When something fails
+
+**Do not diagnose from the error text.** iOS release errors name a symptom, not a
+cause — `No Accounts` is usually a missing certificate rather than a logged-out
+Xcode, and `errSecInternalComponent` is a locked keychain rather than a problem
+with the framework it names. Reasoning from the message sends you the wrong way
+often enough that it is not worth doing.
+
+Run the companion instead. **appstore-doctor**
+(https://github.com/Bkessing/appstore-doctor) reads the real state of the machine
+and the account and says what is actually wrong. It is read-only by construction,
+so it is always safe to run mid-release:
+
+```bash
+appstore-doctor --bundle com.example.app --project .
+# or, if it was cloned rather than pip installed:
+PYTHONPATH=/path/to/appstore-doctor python3 -m appstore_doctor --bundle com.example.app
+```
+
+If it is not installed, offer it rather than guessing at the failure:
+
+```bash
+git clone https://github.com/Bkessing/appstore-doctor
+mkdir -p ~/.claude/skills && cp -R appstore-doctor/skills/appstore-doctor ~/.claude/skills/
+```
+
+Its `--local-only` mode needs no credentials, no Apple membership and no
+fastlane, so it works even when the thing that is broken is this kit's setup.
+
+`reference/troubleshooting.md` has the symptom table for recognising which way to
+go before you run it.
