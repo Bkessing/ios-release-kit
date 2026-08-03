@@ -572,7 +572,16 @@ platform :ios do
     b = (v.build rescue nil)
     UI.message("BUILD uses_non_exempt_encryption=#{(b&.uses_non_exempt_encryption rescue 'n/a')}")
 
-    subs_exist = (app.get_subscription_groups.any? rescue false)
+    # Fail SAFE, not open. If this call throws we must assume subscriptions
+    # exist and run the guard anyway: silently skipping the check on an app that
+    # does have them is exactly how a 3.1.2 rejection slips through, and a
+    # spurious warning costs nothing by comparison.
+    subs_exist = begin
+      app.get_subscription_groups.any?
+    rescue => e
+      UI.important("Could not read subscription groups (#{e.class}); assuming they exist.")
+      true
+    end
     unless subs_exist
       UI.success("No auto-renewing subscriptions — Guideline 3.1.2 does not apply.")
       next
