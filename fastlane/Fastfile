@@ -548,4 +548,49 @@ platform :ios do
     d ? d.update(attributes: review_attrs) : v.create_app_store_review_detail(attributes: review_attrs)
     UI.success("Staged support URL and review info. Submission is a separate lane.")
   end
+
+  desc "Pre-submission guard: version state, screenshots, and Guideline 3.1.2 metadata. STRICT=1 to fail."
+  # Added after a version was rejected twice for 3.1.2. A description rewrite
+  # silently dropped the legal footer AND the auto-renew disclosure, and Apple's
+  # automated message named only the EULA link -- so fixing just what the message
+  # said would have earned a second rejection. Apps with auto-renewable
+  # subscriptions must carry, in the metadata: subscription length, price, and
+  # functional links to the privacy policy and Terms of Use.
+  lane :asc_check do
+    api_key
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version
+    UI.user_error!("No editable version to check") if v.nil?
+    UI.message("VERSION state=#{v.app_store_state}")
+
+    loc = v.get_app_store_version_localizations.find { |l| l.locale == "en-US" }
+    if loc
+      types = loc.get_app_screenshot_sets.map { |x| "#{x.screenshot_display_type}(#{x.app_screenshots.count})" }
+      UI.message("SCREENSHOT SETS: #{types.join(', ')}")
+    end
+
+    b = (v.build rescue nil)
+    UI.message("BUILD uses_non_exempt_encryption=#{(b&.uses_non_exempt_encryption rescue 'n/a')}")
+
+    subs_exist = (app.get_subscription_groups.any? rescue false)
+    unless subs_exist
+      UI.success("No auto-renewing subscriptions — Guideline 3.1.2 does not apply.")
+      next
+    end
+
+    desc_text = loc ? loc.description.to_s : ""
+    missing = []
+    missing << "Terms of Use / EULA link" unless desc_text.match?(/eula|terms of use/i) && desc_text.include?("http")
+    missing << "privacy policy link"      unless desc_text.match?(%r{https?://\S*privacy}i)
+    missing << "'auto-renewing' subscription disclosure" unless desc_text.match?(/auto.?renew/i)
+    missing << "billing period (monthly/yearly/weekly)"  unless desc_text.match?(/month|year|week/i)
+
+    if missing.empty?
+      UI.success("3.1.2 METADATA: ok (EULA link, privacy link, auto-renew disclosure, billing period all present)")
+    else
+      UI.error("3.1.2 METADATA MISSING: #{missing.join(' | ')}")
+      UI.error("This app has auto-renewable subscriptions, so submitting like this WILL be rejected.")
+      UI.user_error!("asc_check failed the Guideline 3.1.2 metadata guard") if ENV["STRICT"]
+    end
+  end
 end
