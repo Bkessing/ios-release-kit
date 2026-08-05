@@ -392,6 +392,81 @@ platform :ios do
   # Assets + metadata
   # -------------------------------------------------------------------------
 
+  desc "Unstick a REJECTED version whose old submission never resolved."
+  # Replying in Resolution Center does NOT resubmit. The submission stays in
+  # UNRESOLVED_ISSUES and keeps hold of the version, so every resubmit fails
+  # with STATE_ERROR reported against the VERSION -- "Version is not ready to be
+  # submitted yet, please try again later" -- which sends you looking at the
+  # version, the build, the metadata, anywhere but the real cause. Lab Tycoon
+  # sat in that state for 18 days.
+  #
+  # The existing `resubmit` lane is for a submission stuck in the review QUEUE.
+  # This one is for a submission that came back rejected and was never cleared.
+  #
+  # Attached IAPs stuck in IN_REVIEW cannot be withdrawn from the API or the
+  # dashboard. They free themselves to READY_TO_SUBMIT when the parent
+  # submission is cancelled, so there is nothing to do about them by hand.
+  lane :resubmit_rejected do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+
+    version = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=1&filter[platform]=IOS")["data"].first
+    UI.user_error!("No version found") if version.nil?
+    state = version.dig("attributes", "appStoreState")
+    UI.message("version #{version.dig('attributes', 'versionString')} is #{state}")
+
+    subs = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=10")["data"]
+    stuck = subs.select { |s| s.dig("attributes", "state") == "UNRESOLVED_ISSUES" }
+    if stuck.empty?
+      UI.success("No submission is stuck. Use `submit` instead.")
+      next
+    end
+    UI.important("#{stuck.count} stuck submission(s) holding the version")
+
+    # Create the replacement FIRST. If cancelling fails halfway there is still
+    # somewhere to attach the version, rather than a version owned by nothing.
+    fresh = asc_http(:post, "/v1/reviewSubmissions", {
+      "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
+                  "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
+    })["data"]
+    UI.message("created submission #{fresh['id']}")
+
+    stuck.each do |s|
+      asc_http(:patch, "/v1/reviewSubmissions/#{s['id']}",
+               { "data" => { "type" => "reviewSubmissions", "id" => s["id"],
+                             "attributes" => { "canceled" => true } } })
+      UI.message("cancelled #{s['id']}")
+    end
+
+    # Cancelling is async. The version stays owned until it settles, so poll
+    # rather than assuming one sleep is enough.
+    attached = false
+    8.times do |i|
+      begin
+        asc_http(:post, "/v1/reviewSubmissionItems", {
+          "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+            "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => fresh["id"] } },
+            "appStoreVersion" => { "data" => { "type" => "appStoreVersions", "id" => version["id"] } } } }
+        })
+        attached = true
+        break
+      rescue FastlaneCore::Interface::FastlaneError
+        UI.message("  version still held, retrying (#{i + 1}/8)")
+        sleep(15)
+      end
+    end
+    UI.user_error!("Version never came free. Re-run in a few minutes.") unless attached
+    UI.success("version attached to #{fresh['id']}")
+
+    asc_http(:patch, "/v1/reviewSubmissions/#{fresh['id']}",
+             { "data" => { "type" => "reviewSubmissions", "id" => fresh["id"],
+                           "attributes" => { "submitted" => true } } })
+    final = asc_http(:get, "/v1/reviewSubmissions/#{fresh['id']}").dig("data", "attributes", "state")
+    UI.success("submitted. state=#{final}")
+    UI.important("Review notes are NOT changed by this lane. If the rejection was") 
+    UI.important("about something a reviewer could not find, fix the notes first.")
+  end
+
   desc "Replace BOTH iPhone screenshot sets. IRK_SHOTS_DIR=<dir with 65/ subdir>"
   # The previous version of this lane wrote only APP_IPHONE_65. That is the
   # SECONDARY set: APP_IPHONE_67 (6.9in) is what modern iPhones render in search
