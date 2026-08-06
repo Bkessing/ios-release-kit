@@ -589,9 +589,13 @@ platform :ios do
     iaps.each do |iap|
       pid  = iap.dig("attributes", "productId")
       vers = asc_http(:get, "/v2/inAppPurchases/#{iap['id']}/versions?limit=10")["data"]
-      live = vers.find { |v| v.dig("attributes", "state") != "DEVELOPER_REJECTED" }
+      # DEVELOPER_REJECTED is NOT terminal, and NOT replaceable: that child is
+      # still the product's inflight version, so trying to create a new one
+      # earns STATE_ERROR.ALREADY_EXISTS naming the very id you were avoiding.
+      # Attaching it to a fresh submission is what revives it. Only an empty
+      # array means there is genuinely nothing to attach.
+      live = vers.find { |v| v.dig("attributes", "state") != "DEVELOPER_REJECTED" } || vers.first
       if live.nil?
-        # DEVELOPER_REJECTED is terminal for that child; make a new one.
         # Note the asymmetry: reviewSubmissionItems links the CHILD via
         # `inAppPurchaseVersion`, but creating that child links the PARENT via
         # `inAppPurchase` -- not `inAppPurchaseV2`, which the API rejects here
@@ -601,6 +605,8 @@ platform :ios do
             "inAppPurchase" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
         })["data"]
         UI.message("  created a fresh version for #{pid}")
+      else
+        UI.message("  using #{pid} version #{live['id']} (#{live.dig('attributes', 'state')})")
       end
       asc_http(:post, "/v1/reviewSubmissionItems", {
         "data" => { "type" => "reviewSubmissionItems", "relationships" => {
