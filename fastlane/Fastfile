@@ -405,7 +405,15 @@ platform :ios do
   #
   # Attached IAPs stuck in IN_REVIEW cannot be withdrawn from the API or the
   # dashboard. They free themselves to READY_TO_SUBMIT when the parent
-  # submission is cancelled, so there is nothing to do about them by hand.
+  # submission is cancelled -- and that is the trap. Freeing them DETACHES them.
+  # Unless they are re-attached here, the replacement submission carries the
+  # version alone, review never sees the products, and the app is approved
+  # without them. It then goes on sale able to take no money, and nothing
+  # anywhere reports a problem: the listing is live and downloads arrive.
+  #
+  # Lab Tycoon shipped exactly this way on 2026-08-06. The rejected 07-18
+  # submission had three items (version + two IAPs); the replacement built on
+  # 08-04 had one, and was approved.
   lane :resubmit_rejected do
     connect!
     app = Spaceship::ConnectAPI::App.find(app_id)
@@ -458,6 +466,25 @@ platform :ios do
     UI.user_error!("Version never came free. Re-run in a few minutes.") unless attached
     UI.success("version attached to #{fresh['id']}")
 
+    # Re-attach the products the cancellation freed. Skip MISSING_METADATA:
+    # those cannot pass review and would sink the version with them.
+    iaps = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
+    iaps.each do |iap|
+      pid   = iap.dig("attributes", "productId")
+      state = iap.dig("attributes", "state")
+      if state == "MISSING_METADATA"
+        UI.important("skipping #{pid} — MISSING_METADATA, would be rejected with the version")
+        next
+      end
+      next unless state == "READY_TO_SUBMIT"
+      asc_http(:post, "/v1/reviewSubmissionItems", {
+        "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+          "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => fresh["id"] } },
+          "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
+      })
+      UI.success("re-attached #{pid}")
+    end
+
     asc_http(:patch, "/v1/reviewSubmissions/#{fresh['id']}",
              { "data" => { "type" => "reviewSubmissions", "id" => fresh["id"],
                            "attributes" => { "submitted" => true } } })
@@ -465,6 +492,74 @@ platform :ios do
     UI.success("submitted. state=#{final}")
     UI.important("Review notes are NOT changed by this lane. If the rejection was") 
     UI.important("about something a reviewer could not find, fix the notes first.")
+  end
+
+  desc "Submit unapproved in-app purchases on a LIVE app. DRY=1 to preview."
+  # Once an app is on sale, its IAPs are submitted on their own -- they do not
+  # need a new binary and do not wait for a version. Nothing in App Store
+  # Connect tells you they were left behind: the listing is live, downloads
+  # arrive, and the app quietly takes no money.
+  #
+  # Lab Tycoon shipped 1.0 on 2026-08-06 with both products in READY_TO_SUBMIT
+  # after the 2.1(b) fight, and appstore-doctor reported it as a PASS ("0 of 2
+  # approved") because it only looked for trouble before submission. Run
+  # `appstore-doctor --bundle <id>` after any release; it now FAILs on this.
+  #
+  # MISSING_METADATA products are skipped rather than submitted. They have no
+  # display name, description or review screenshot, so submitting them earns a
+  # rejection that also holds up the products that were ready. Complete them or
+  # delete them; do not sweep them in here.
+  lane :submit_iaps do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    dry = !ENV["DRY"].to_s.empty?
+
+    iaps = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
+    ready = iaps.select { |i| i.dig("attributes", "state") == "READY_TO_SUBMIT" }
+    blocked = iaps.select { |i| i.dig("attributes", "state") == "MISSING_METADATA" }
+
+    iaps.each { |i| UI.message("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
+
+    blocked.each do |i|
+      UI.important("skipping #{i.dig('attributes', 'productId')} — MISSING_METADATA, would be rejected")
+    end
+
+    if ready.empty?
+      UI.success("Nothing to submit. No product is in READY_TO_SUBMIT.")
+      next
+    end
+
+    if dry
+      UI.important("DRY=1 — would submit #{ready.count} product(s), no request sent")
+      next
+    end
+
+    # Reuse an open submission if one exists. Creating a second one while the
+    # first holds these products fails with ITEM_PART_OF_ANOTHER_SUBMISSION,
+    # which reports against the item and reads like the product is broken.
+    open = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=10")["data"]
+             .find { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
+
+    submission = open || asc_http(:post, "/v1/reviewSubmissions", {
+      "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
+                  "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
+    })["data"]
+    UI.message(open ? "reusing submission #{submission['id']}" : "created submission #{submission['id']}")
+
+    ready.each do |iap|
+      asc_http(:post, "/v1/reviewSubmissionItems", {
+        "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+          "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => submission["id"] } },
+          "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
+      })
+      UI.message("attached #{iap.dig('attributes', 'productId')}")
+    end
+
+    asc_http(:patch, "/v1/reviewSubmissions/#{submission['id']}",
+             { "data" => { "type" => "reviewSubmissions", "id" => submission["id"],
+                           "attributes" => { "submitted" => true } } })
+    final = asc_http(:get, "/v1/reviewSubmissions/#{submission['id']}").dig("data", "attributes", "state")
+    UI.success("submitted #{ready.count} in-app purchase(s). state=#{final}")
   end
 
   desc "Replace BOTH iPhone screenshot sets. IRK_SHOTS_DIR=<dir with 65/ subdir>"
