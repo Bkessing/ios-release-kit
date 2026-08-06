@@ -503,6 +503,113 @@ platform :ios do
     UI.important("about something a reviewer could not find, fix the notes first.")
   end
 
+  desc "Submit the editable version AND its unapproved in-app purchases together. DRY=1 to preview."
+  # The only way to get a FIRST consumable or FIRST non-consumable approved:
+  # one reviewSubmission carrying the app version and every product, with all
+  # items attached BEFORE submitted=true. Submitting the version alone is how
+  # Lab Tycoon went on sale unable to take money.
+  #
+  # The relationship is `inAppPurchaseVersion` -> type `inAppPurchaseVersions`,
+  # using the product's CHILD version id from GET /v2/inAppPurchases/{id}/versions.
+  # reviewSubmissionItems has no `inAppPurchaseV2` relationship; posting one
+  # returns 409 ENTITY_ERROR.RELATIONSHIP.UNKNOWN. Products whose child version
+  # is DEVELOPER_REJECTED (what cancelling a submission leaves behind) get a
+  # fresh one via POST /v1/inAppPurchaseVersions.
+  lane :submit_with_iaps do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    dry = !ENV["DRY"].to_s.empty?
+
+    version = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=10&filter[platform]=IOS")["data"]
+                .find { |v| %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED]
+                              .include?(v.dig("attributes", "appStoreState")) }
+    UI.user_error!("No editable version. Run new_version first.") if version.nil?
+    UI.message("version #{version.dig('attributes', 'versionString')} (#{version.dig('attributes', 'appStoreState')})")
+
+    iaps = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
+             .reject { |i| i.dig("attributes", "state") == "APPROVED" }
+    iaps.each { |i| UI.message("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
+
+    skip = iaps.select { |i| i.dig("attributes", "state") == "MISSING_METADATA" }
+    skip.each { |i| UI.important("skipping #{i.dig('attributes', 'productId')} — MISSING_METADATA would sink the version with it") }
+    iaps -= skip
+
+    if dry
+      UI.important("DRY=1 — would submit the version plus #{iaps.count} product(s)")
+      next
+    end
+
+    # An itemless READY_FOR_REVIEW submission is reused rather than orphaned;
+    # opening a second one while it exists earns ITEM_PART_OF_ANOTHER_SUBMISSION.
+    existing = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+                 .select { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
+                 .find { |s| asc_http(:get, "/v1/reviewSubmissions/#{s['id']}/items?limit=5")["data"].empty? }
+
+    sub = existing || asc_http(:post, "/v1/reviewSubmissions", {
+      "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
+                  "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
+    })["data"]
+    UI.message(existing ? "reusing empty submission #{sub['id']}" : "created submission #{sub['id']}")
+
+    # Cancelling a previous submission releases the version asynchronously, so
+    # the first attach can fail purely on timing.
+    attached = false
+    6.times do |i|
+      begin
+        asc_http(:post, "/v1/reviewSubmissionItems", {
+          "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+            "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => sub["id"] } },
+            "appStoreVersion" => { "data" => { "type" => "appStoreVersions", "id" => version["id"] } } } }
+        })
+        attached = true
+        break
+      rescue FastlaneCore::Interface::FastlaneError => e
+        raise if e.message.include?("already been added") && i == 5
+        UI.message("  version not free yet, retrying (#{i + 1}/6)")
+        sleep(10)
+      end
+    end
+    UI.user_error!("Version never came free.") unless attached
+    UI.success("attached version")
+
+    iaps.each do |iap|
+      pid  = iap.dig("attributes", "productId")
+      vers = asc_http(:get, "/v2/inAppPurchases/#{iap['id']}/versions?limit=10")["data"]
+      live = vers.find { |v| v.dig("attributes", "state") != "DEVELOPER_REJECTED" }
+      if live.nil?
+        # DEVELOPER_REJECTED is terminal for that child; make a new one.
+        live = asc_http(:post, "/v1/inAppPurchaseVersions", {
+          "data" => { "type" => "inAppPurchaseVersions", "relationships" => {
+            "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
+        })["data"]
+        UI.message("  created a fresh version for #{pid}")
+      end
+      asc_http(:post, "/v1/reviewSubmissionItems", {
+        "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+          "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => sub["id"] } },
+          "inAppPurchaseVersion" => { "data" => { "type" => "inAppPurchaseVersions", "id" => live["id"] } } } }
+      })
+      UI.success("attached #{pid}")
+    end
+
+    # Submitting an empty submission is a silent no-op that looks like success.
+    items = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}/items?limit=50")["data"]
+    UI.user_error!("Submission has no items — refusing to submit") if items.empty?
+    UI.message("#{items.count} item(s) attached")
+
+    asc_http(:patch, "/v1/reviewSubmissions/#{sub['id']}",
+             { "data" => { "type" => "reviewSubmissions", "id" => sub["id"],
+                           "attributes" => { "submitted" => true } } })
+
+    state = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}").dig("data", "attributes", "state")
+    UI.success("submitted. state=#{state}")
+    # No flip to WAITING_FOR_REVIEW means not actually attached, which is the
+    # 2.1(b) rejection waiting to happen.
+    asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"].each do |i|
+      UI.message("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}")
+    end
+  end
+
   desc "Report/submit unapproved in-app purchases on a LIVE app. DRY=1 to preview."
   #
   # KNOWN LIMIT: /v1/inAppPurchaseSubmissions only works for a product whose
