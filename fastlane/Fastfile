@@ -521,7 +521,11 @@ platform :ios do
     dry = !ENV["DRY"].to_s.empty?
 
     version = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=10&filter[platform]=IOS")["data"]
-                .find { |v| %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED]
+                # READY_FOR_REVIEW belongs here: attaching a version to a
+                # submission moves it out of PREPARE_FOR_SUBMISSION before
+                # anything is submitted, so a lane that only looks for editable
+                # states cannot finish the job it started on its own re-run.
+                .find { |v| %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED READY_FOR_REVIEW]
                               .include?(v.dig("attributes", "appStoreState")) }
     UI.user_error!("No editable version. Run new_version first.") if version.nil?
     UI.message("version #{version.dig('attributes', 'versionString')} (#{version.dig('attributes', 'appStoreState')})")
