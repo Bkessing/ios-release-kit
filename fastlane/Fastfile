@@ -541,36 +541,46 @@ platform :ios do
 
     # An itemless READY_FOR_REVIEW submission is reused rather than orphaned;
     # opening a second one while it exists earns ITEM_PART_OF_ANOTHER_SUBMISSION.
+    # Reuse ANY unsubmitted submission, not just an itemless one. A partially
+    # built submission is exactly what a failed run leaves behind, and opening a
+    # second one then fails with ITEM_PART_OF_ANOTHER_SUBMISSION -- reported
+    # against the version, which sends you looking at the version instead of at
+    # the leftover. Re-running this lane has to converge.
     existing = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
-                 .select { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
-                 .find { |s| asc_http(:get, "/v1/reviewSubmissions/#{s['id']}/items?limit=5")["data"].empty? }
+                 .find { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
 
     sub = existing || asc_http(:post, "/v1/reviewSubmissions", {
       "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
                   "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
     })["data"]
-    UI.message(existing ? "reusing empty submission #{sub['id']}" : "created submission #{sub['id']}")
+    UI.message(existing ? "reusing submission #{sub['id']}" : "created submission #{sub['id']}")
 
-    # Cancelling a previous submission releases the version asynchronously, so
-    # the first attach can fail purely on timing.
-    attached = false
-    6.times do |i|
-      begin
-        asc_http(:post, "/v1/reviewSubmissionItems", {
-          "data" => { "type" => "reviewSubmissionItems", "relationships" => {
-            "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => sub["id"] } },
-            "appStoreVersion" => { "data" => { "type" => "appStoreVersions", "id" => version["id"] } } } }
-        })
-        attached = true
-        break
-      rescue FastlaneCore::Interface::FastlaneError => e
-        raise if e.message.include?("already been added") && i == 5
-        UI.message("  version not free yet, retrying (#{i + 1}/6)")
-        sleep(10)
+    already = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}/items?limit=50&include=appStoreVersion")["data"]
+    have_version = already.any? { |it| it.dig("relationships", "appStoreVersion", "data") }
+
+    if have_version
+      UI.message("version already attached")
+    else
+      # Cancelling a previous submission releases the version asynchronously, so
+      # the first attach can fail purely on timing.
+      attached = false
+      6.times do |i|
+        begin
+          asc_http(:post, "/v1/reviewSubmissionItems", {
+            "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+              "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => sub["id"] } },
+              "appStoreVersion" => { "data" => { "type" => "appStoreVersions", "id" => version["id"] } } } }
+          })
+          attached = true
+          break
+        rescue FastlaneCore::Interface::FastlaneError
+          UI.message("  version not free yet, retrying (#{i + 1}/6)")
+          sleep(10)
+        end
       end
+      UI.user_error!("Version never came free.") unless attached
+      UI.success("attached version")
     end
-    UI.user_error!("Version never came free.") unless attached
-    UI.success("attached version")
 
     iaps.each do |iap|
       pid  = iap.dig("attributes", "productId")
@@ -578,9 +588,13 @@ platform :ios do
       live = vers.find { |v| v.dig("attributes", "state") != "DEVELOPER_REJECTED" }
       if live.nil?
         # DEVELOPER_REJECTED is terminal for that child; make a new one.
+        # Note the asymmetry: reviewSubmissionItems links the CHILD via
+        # `inAppPurchaseVersion`, but creating that child links the PARENT via
+        # `inAppPurchase` -- not `inAppPurchaseV2`, which the API rejects here
+        # even though that is the name on the app's own relationship.
         live = asc_http(:post, "/v1/inAppPurchaseVersions", {
           "data" => { "type" => "inAppPurchaseVersions", "relationships" => {
-            "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
+            "inAppPurchase" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
         })["data"]
         UI.message("  created a fresh version for #{pid}")
       end
