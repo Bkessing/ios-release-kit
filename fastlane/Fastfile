@@ -487,8 +487,10 @@ platform :ios do
     unless freed.empty?
       UI.error("#{freed.count} in-app purchase(s) are NOT part of this submission:")
       freed.each { |i| UI.error("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
-      UI.error("Submit each one from App Store Connect (Monetization > In-App Purchases >")
-      UI.error("the product > Submit for Review), or the app ships unable to sell it.")
+      UI.error("Attach each product's child inAppPurchaseVersion to THIS submission")
+      UI.error("before PATCHing submitted=true: GET /v2/inAppPurchases/{id}/versions,")
+      UI.error("then POST /v1/reviewSubmissionItems with relationship")
+      UI.error("`inAppPurchaseVersion` -> type `inAppPurchaseVersions`.")
       UI.error("Verify afterwards with: appstore-doctor --bundle #{app_id}")
     end
 
@@ -503,16 +505,28 @@ platform :ios do
 
   desc "Report/submit unapproved in-app purchases on a LIVE app. DRY=1 to preview."
   #
-  # KNOWN LIMIT: this works only for a product with a pending version. A product
-  # whose pending version was consumed -- typically by cancelling the submission
-  # it was attached to -- answers
+  # KNOWN LIMIT: /v1/inAppPurchaseSubmissions only works for a product whose
+  # TYPE has already had one product approved. The FIRST consumable and the
+  # FIRST non-consumable must each be submitted WITH an app version instead.
+  #
+  # Two different errors come out of that, and neither says so:
+  #   STATE_ERROR.FIRST_NON_CONSUMABLE_MUST_BE_SUBMITTED_ON_VERSION
   #   ENTITY_ERROR.RELATIONSHIP.INVALID
-  #   "InAppPurchase <id> has no pending version for submission"
-  # even though its state reads READY_TO_SUBMIT and its metadata is complete
-  # (price schedule, localization, review screenshot, availability all present
-  # and correct). Nothing in the API re-creates that pending version; open the
-  # product in App Store Connect and submit it there. The diagnosis above is
-  # still worth running first, because it names exactly which products are dead.
+  #     "InAppPurchase <id> has no pending version for submission"
+  # The second is the one you get after cancelling a submission the product was
+  # attached to: that leaves its child inAppPurchaseVersion in
+  # DEVELOPER_REJECTED, which is not "pending". Check with
+  #   GET /v2/inAppPurchases/{id}/versions
+  # The product itself still reads READY_TO_SUBMIT with complete metadata, so
+  # nothing looks wrong at the level anyone inspects.
+  #
+  # The co-submit route is fully automatable and documented in the ASC ops
+  # notes: attach the version AND each product to ONE reviewSubmission, using
+  # relationship `inAppPurchaseVersion` -> type `inAppPurchaseVersions` with the
+  # child version id (NOT `inAppPurchaseV2`, which does not exist on that
+  # resource). Attach every item BEFORE PATCHing submitted=true. Since it needs
+  # an app version to ride, a live app must carry its stranded products on the
+  # next release rather than sending them alone.
   # Once an app is on sale, its IAPs are submitted on their own -- they do not
   # need a new binary and do not wait for a version. Nothing in App Store
   # Connect tells you they were left behind: the listing is live, downloads
