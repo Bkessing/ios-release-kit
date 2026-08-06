@@ -138,7 +138,8 @@ def asc_http(method, path, body = nil)
   require "json"
   connect!
   uri = URI("https://api.appstoreconnect.apple.com#{path}")
-  klass = { get: Net::HTTP::Get, post: Net::HTTP::Post, patch: Net::HTTP::Patch }.fetch(method)
+  klass = { get: Net::HTTP::Get, post: Net::HTTP::Post, patch: Net::HTTP::Patch,
+            delete: Net::HTTP::Delete }.fetch(method)
   req = klass.new(uri)
   req["Authorization"] = "Bearer #{Spaceship::ConnectAPI.token.text}"
   req["Content-Type"] = "application/json"
@@ -539,14 +540,28 @@ platform :ios do
     # ITEM_PART_OF_ANOTHER_SUBMISSION and points at the version rather than at
     # this leftover. An earlier version of this lane created one on every run
     # before failing, so clear any that are sitting there with no items.
+    #
+    # This is hygiene, not the job, so it must never abort the run. A leftover
+    # that was never submitted is not "cancellable" -- Apple answers
+    # STATE_ERROR.ENTITY_STATE_INVALID, "Resource is not in cancellable state"
+    # -- it is deleted. Try both and shrug if neither works.
     asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
       .select { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
       .each do |s|
         next unless asc_http(:get, "/v1/reviewSubmissions/#{s['id']}/items?limit=5")["data"].empty?
-        asc_http(:patch, "/v1/reviewSubmissions/#{s['id']}",
-                 { "data" => { "type" => "reviewSubmissions", "id" => s["id"],
-                               "attributes" => { "canceled" => true } } })
-        UI.important("cancelled empty submission #{s['id']}")
+        begin
+          asc_http(:delete, "/v1/reviewSubmissions/#{s['id']}")
+          UI.important("deleted empty submission #{s['id']}")
+        rescue FastlaneCore::Interface::FastlaneError
+          begin
+            asc_http(:patch, "/v1/reviewSubmissions/#{s['id']}",
+                     { "data" => { "type" => "reviewSubmissions", "id" => s["id"],
+                                   "attributes" => { "canceled" => true } } })
+            UI.important("cancelled empty submission #{s['id']}")
+          rescue FastlaneCore::Interface::FastlaneError
+            UI.important("left empty submission #{s['id']} in place (not deletable or cancellable)")
+          end
+        end
       end
 
     # An in-app purchase is NOT submitted through reviewSubmissions. The items
