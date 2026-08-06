@@ -467,23 +467,29 @@ platform :ios do
     UI.user_error!("Version never came free. Re-run in a few minutes.") unless attached
     UI.success("version attached to #{fresh['id']}")
 
-    # Re-attach the products the cancellation freed. Skip MISSING_METADATA:
-    # those cannot pass review and would sink the version with them.
-    iaps = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
-    iaps.each do |iap|
-      pid   = iap.dig("attributes", "productId")
-      state = iap.dig("attributes", "state")
-      if state == "MISSING_METADATA"
-        UI.important("skipping #{pid} — MISSING_METADATA, would be rejected with the version")
-        next
-      end
-      next unless state == "READY_TO_SUBMIT"
-      asc_http(:post, "/v1/reviewSubmissionItems", {
-        "data" => { "type" => "reviewSubmissionItems", "relationships" => {
-          "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => fresh["id"] } },
-          "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
-      })
-      UI.success("re-attached #{pid}")
+    # Report the products the cancellation freed. This CANNOT be automated here:
+    # reviewSubmissionItems accepts only appStoreVersion, appEvent and
+    # appCustomProductPageVersion, and POSTing an in-app purchase to it returns
+    #   ENTITY_ERROR.RELATIONSHIP.UNKNOWN
+    # while /v1/inAppPurchaseSubmissions refuses a freed product with
+    #   ENTITY_ERROR.RELATIONSHIP.INVALID
+    #   "InAppPurchase <id> has no pending version for submission"
+    # because cancelling consumed the pending version the product had. The
+    # product keeps its metadata and its READY_TO_SUBMIT state, so nothing looks
+    # wrong; it simply has nothing left to submit until it is re-prepared in the
+    # App Store Connect UI.
+    #
+    # So this is a loud warning, not a silent gap. Lab Tycoon was approved and
+    # went on sale unable to take money precisely because nothing said this out
+    # loud after the version went in without its products.
+    freed = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
+              .reject { |i| i.dig("attributes", "state") == "APPROVED" }
+    unless freed.empty?
+      UI.error("#{freed.count} in-app purchase(s) are NOT part of this submission:")
+      freed.each { |i| UI.error("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
+      UI.error("Submit each one from App Store Connect (Monetization > In-App Purchases >")
+      UI.error("the product > Submit for Review), or the app ships unable to sell it.")
+      UI.error("Verify afterwards with: appstore-doctor --bundle #{app_id}")
     end
 
     asc_http(:patch, "/v1/reviewSubmissions/#{fresh['id']}",
@@ -495,7 +501,18 @@ platform :ios do
     UI.important("about something a reviewer could not find, fix the notes first.")
   end
 
-  desc "Submit unapproved in-app purchases on a LIVE app. DRY=1 to preview."
+  desc "Report/submit unapproved in-app purchases on a LIVE app. DRY=1 to preview."
+  #
+  # KNOWN LIMIT: this works only for a product with a pending version. A product
+  # whose pending version was consumed -- typically by cancelling the submission
+  # it was attached to -- answers
+  #   ENTITY_ERROR.RELATIONSHIP.INVALID
+  #   "InAppPurchase <id> has no pending version for submission"
+  # even though its state reads READY_TO_SUBMIT and its metadata is complete
+  # (price schedule, localization, review screenshot, availability all present
+  # and correct). Nothing in the API re-creates that pending version; open the
+  # product in App Store Connect and submit it there. The diagnosis above is
+  # still worth running first, because it names exactly which products are dead.
   # Once an app is on sale, its IAPs are submitted on their own -- they do not
   # need a new binary and do not wait for a version. Nothing in App Store
   # Connect tells you they were left behind: the listing is live, downloads
