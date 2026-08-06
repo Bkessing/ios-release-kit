@@ -534,32 +534,41 @@ platform :ios do
       next
     end
 
-    # Reuse an open submission if one exists. Creating a second one while the
-    # first holds these products fails with ITEM_PART_OF_ANOTHER_SUBMISSION,
-    # which reports against the item and reads like the product is broken.
-    open = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=10")["data"]
-             .find { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
+    # An empty READY_FOR_REVIEW submission holds nothing but still occupies the
+    # app, so the next version submission fails with
+    # ITEM_PART_OF_ANOTHER_SUBMISSION and points at the version rather than at
+    # this leftover. An earlier version of this lane created one on every run
+    # before failing, so clear any that are sitting there with no items.
+    asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+      .select { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" }
+      .each do |s|
+        next unless asc_http(:get, "/v1/reviewSubmissions/#{s['id']}/items?limit=5")["data"].empty?
+        asc_http(:patch, "/v1/reviewSubmissions/#{s['id']}",
+                 { "data" => { "type" => "reviewSubmissions", "id" => s["id"],
+                               "attributes" => { "canceled" => true } } })
+        UI.important("cancelled empty submission #{s['id']}")
+      end
 
-    submission = open || asc_http(:post, "/v1/reviewSubmissions", {
-      "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
-                  "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
-    })["data"]
-    UI.message(open ? "reusing submission #{submission['id']}" : "created submission #{submission['id']}")
-
+    # An in-app purchase is NOT submitted through reviewSubmissions. The items
+    # resource accepts only appStoreVersion, appEvent and
+    # appCustomProductPageVersion; posting an IAP there returns
+    #   ENTITY_ERROR.RELATIONSHIP.UNKNOWN
+    #   'inAppPurchaseV2' is not a relationship on the resource
+    #     'reviewSubmissionItems'
+    # Products get their own resource, one submission per product, with no
+    # separate "submit" step -- creating it IS submitting it.
     ready.each do |iap|
-      asc_http(:post, "/v1/reviewSubmissionItems", {
-        "data" => { "type" => "reviewSubmissionItems", "relationships" => {
-          "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => submission["id"] } },
+      pid = iap.dig("attributes", "productId")
+      asc_http(:post, "/v1/inAppPurchaseSubmissions", {
+        "data" => { "type" => "inAppPurchaseSubmissions", "relationships" => {
           "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
       })
-      UI.message("attached #{iap.dig('attributes', 'productId')}")
+      UI.success("submitted #{pid}")
     end
 
-    asc_http(:patch, "/v1/reviewSubmissions/#{submission['id']}",
-             { "data" => { "type" => "reviewSubmissions", "id" => submission["id"],
-                           "attributes" => { "submitted" => true } } })
-    final = asc_http(:get, "/v1/reviewSubmissions/#{submission['id']}").dig("data", "attributes", "state")
-    UI.success("submitted #{ready.count} in-app purchase(s). state=#{final}")
+    after = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
+    after.each { |i| UI.message("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
+    UI.success("submitted #{ready.count} in-app purchase(s)")
   end
 
   desc "Replace BOTH iPhone screenshot sets. IRK_SHOTS_DIR=<dir with 65/ subdir>"
