@@ -145,11 +145,18 @@ def asc_http(method, path, body = nil)
   req["Content-Type"] = "application/json"
   req.body = JSON.generate(body) if body
   res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
-  parsed = (res.body.to_s.empty? ? {} : JSON.parse(res.body))
   unless res.code.to_i.between?(200, 299)
     UI.user_error!("ASC #{method.to_s.upcase} #{path} -> #{res.code}\n#{res.body}")
   end
-  parsed
+  # Not every ASC endpoint answers JSON -- offer-code values come back as CSV --
+  # and a parse error there would read as an API failure rather than a format
+  # surprise. Hand back the raw string when it is not JSON.
+  return {} if res.body.to_s.empty?
+  begin
+    JSON.parse(res.body)
+  rescue JSON::ParserError
+    res.body
+  end
 end
 
 platform :ios do
@@ -501,6 +508,81 @@ platform :ios do
     UI.success("submitted. state=#{final}")
     UI.important("Review notes are NOT changed by this lane. If the rejection was") 
     UI.important("about something a reviewer could not find, fix the notes first.")
+  end
+
+  desc "List subscription offer codes and how long each batch has left."
+  # Gift codes expire, and nothing warns you. CardHabit's creator-seeding play
+  # ran on a batch expiring 2026-08-15 while the one creator who converted took
+  # 18 DAYS between the email and signing up -- so codes sent in the final
+  # fortnight were dead on arrival and nobody would ever have reported it.
+  lane :offer_codes do
+    require "date"
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    today = Date.today
+    asc_http(:get, "/v1/apps/#{app.id}/subscriptionGroups?limit=10")["data"].each do |g|
+      asc_http(:get, "/v1/subscriptionGroups/#{g['id']}/subscriptions?limit=20")["data"].each do |s|
+        pid = s.dig("attributes", "productId")
+        asc_http(:get, "/v1/subscriptions/#{s['id']}/offerCodes?limit=20")["data"].each do |oc|
+          a = oc["attributes"]
+          UI.message("#{pid} — offer '#{a['name']}' (#{a['duration']} x#{a['numberOfPeriods']}) active=#{a['active']}")
+          UI.message("  id #{oc['id']}")
+          asc_http(:get, "/v1/subscriptionOfferCodes/#{oc['id']}/oneTimeUseCodes?limit=20")["data"].each do |b|
+            ba = b["attributes"]
+            exp = Date.parse(ba["expirationDate"]) rescue nil
+            days = exp ? (exp - today).to_i : nil
+            note = if !ba["active"] then "INACTIVE"
+                   elsif days.nil? then ""
+                   elsif days <= 0 then "EXPIRED"
+                   elsif days <= 21 then "EXPIRES IN #{days}d — shorter than the 18-day lag seen on the one conversion"
+                   else "#{days}d left"
+                   end
+            line = "  batch #{b['id'][0, 8]}  #{ba['numberOfCodes']} codes  expires #{ba['expirationDate']}  #{note}"
+            days && days <= 21 && ba["active"] ? UI.important(line) : UI.message(line)
+          end
+        end
+      end
+    end
+  end
+
+  desc "Mint a fresh one-time offer-code batch. OFFER_CODE_ID= COUNT=500 EXPIRES=YYYY-MM-DD OUT=<path>"
+  # Apple's minimum batch is 500; 25 and 100 are both rejected as "invalid
+  # number of codes". Expiration must be a future date and Apple caps it at six
+  # months out.
+  #
+  # The codes themselves come back as CSV from a DIFFERENT endpoint than the one
+  # that creates the batch, and they are the deliverable -- creating a batch you
+  # never download is useless. Written outside any repo by default.
+  lane :new_offer_codes do
+    require "date"
+    connect!
+    offer_id = ENV["OFFER_CODE_ID"] or UI.user_error!("Set OFFER_CODE_ID= (run `offer_codes` to find it)")
+    count    = (ENV["COUNT"] || "500").to_i
+    expires  = ENV["EXPIRES"] or UI.user_error!("Set EXPIRES=YYYY-MM-DD")
+    out      = ENV["OUT"] || File.expand_path("~/Downloads/offer-codes-#{expires}.csv")
+
+    UI.user_error!("Apple's minimum batch is 500") if count < 500
+    exp = Date.parse(expires)
+    UI.user_error!("EXPIRES must be in the future") if exp <= Date.today
+    UI.user_error!("Apple caps expiration at six months out") if exp > Date.today + 183
+
+    batch = asc_http(:post, "/v1/subscriptionOfferCodeOneTimeUseCodes", {
+      "data" => { "type" => "subscriptionOfferCodeOneTimeUseCodes",
+                  "attributes" => { "numberOfCodes" => count, "expirationDate" => expires },
+                  "relationships" => { "offerCode" => { "data" => {
+                    "type" => "subscriptionOfferCodes", "id" => offer_id } } } }
+    })["data"]
+    UI.success("created batch #{batch['id']} — #{count} codes, expires #{expires}")
+
+    csv = asc_http(:get, "/v1/subscriptionOfferCodeOneTimeUseCodes/#{batch['id']}/values")
+    if csv.is_a?(String) && !csv.strip.empty?
+      File.write(out, csv)
+      UI.success("wrote #{csv.lines.count - 1} codes to #{out}")
+    else
+      UI.important("Batch created but the values endpoint returned nothing yet.")
+      UI.important("Apple generates them asynchronously; re-fetch in a minute:")
+      UI.important("  /v1/subscriptionOfferCodeOneTimeUseCodes/#{batch['id']}/values")
+    end
   end
 
   desc "Submit the editable version AND its unapproved in-app purchases together. DRY=1 to preview."
