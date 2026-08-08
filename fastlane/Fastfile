@@ -1116,6 +1116,71 @@ platform :ios do
     UI.success("Availability created across #{territories.count} territories.")
   end
 
+  desc "Turn on App Store analytics reports. SNAPSHOT=1 backfills history instead of starting a feed."
+  # Apple does NOT keep analytics waiting for you to ask. It generates reports
+  # only for apps that have an analyticsReportRequest, and an app without one has
+  # no impressions, no source types and no download reports -- not "empty", but
+  # absent. You discover this the day you first want to know where an install
+  # came from, which is the day it is already too late.
+  #
+  # That is exactly how it went: Lab Tycoon launched, took two organic installs
+  # on day one, and had no request on the app, so Apple could not say whether
+  # either came from search.
+  #
+  # Two access types, and the difference matters:
+  #
+  #   ONGOING           starts a daily feed FROM NOW. It cannot see the past.
+  #   ONE_TIME_SNAPSHOT backfills up to a year of history, once.
+  #
+  # So a launch needs both: the snapshot to recover what already happened, the
+  # feed to keep it coming. Run this the day the app record exists, not the day
+  # you want a number.
+  #
+  # Reading the reports back is a GET, so it lives in appstore-doctor rather than
+  # here. This lane only turns the tap on.
+  lane :analytics_report do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    # App.find returns nil for a bundle id this account does not own, and the
+    # next line would die on `undefined method 'id' for nil` -- an error that
+    # says nothing about the actual mistake, which is almost always a typo in
+    # IRK_APP_ID. Name it instead.
+    UI.user_error!("No app on this account with bundle id #{app_id}. Check IRK_APP_ID.") if app.nil?
+    want = ENV["SNAPSHOT"] ? "ONE_TIME_SNAPSHOT" : "ONGOING"
+
+    existing = asc_http(:get, "/v1/apps/#{app.id}/analyticsReportRequests?limit=50")["data"] || []
+    existing.each do |r|
+      a = r["attributes"]
+      # Apple switches a feed off when nobody ever collects from it. The request
+      # still exists and still reads as configured, so the only tell is this
+      # flag, and a stopped feed looks exactly like a working one until you go
+      # looking for a date range that is missing.
+      state = a["stoppedDueToInactivity"] ? "STOPPED (inactivity)" : "active"
+      UI.message("  existing: #{a['accessType']} #{state}  #{r['id']}")
+    end
+
+    live = existing.find { |r| r["attributes"]["accessType"] == want &&
+                              !r["attributes"]["stoppedDueToInactivity"] }
+    if live
+      UI.success("#{want} request already active (#{live['id']}). Nothing to do.")
+      next
+    end
+
+    made = asc_http(:post, "/v1/analyticsReportRequests", {
+      "data" => {
+        "type" => "analyticsReportRequests",
+        "attributes" => { "accessType" => want },
+        "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } }
+      }
+    })
+    UI.success("#{want} analytics request created: #{made.dig('data', 'id')}")
+    # Apple generates nothing synchronously. Saying "done" here without the wait
+    # would send someone to look for reports that cannot exist yet, and conclude
+    # the lane failed.
+    UI.important("Apple takes roughly a day to produce the first reports. Check back tomorrow.")
+    UI.message("Run again with SNAPSHOT=1 to also backfill history.") unless ENV["SNAPSHOT"]
+  end
+
   desc "Pre-submission guard: version state, screenshots, and Guideline 3.1.2 metadata. STRICT=1 to fail."
   # Added after a version was rejected twice for 3.1.2. A description rewrite
   # silently dropped the legal footer AND the auto-renew disclosure, and Apple's

@@ -149,6 +149,7 @@ surfacing later as a confusing Apple error.
 | `stage` | support URL + App Review contact details |
 | `set_privacy_policy` | privacy policy URL on every locale |
 | `open_territories` | make the app available in every territory |
+| `analytics_report` | turn on App Store analytics. `SNAPSHOT=1` backfills history |
 
 **Status**
 
@@ -167,6 +168,16 @@ Accounts` followed by `No profiles for '<bundle>' were found` — which is
 misleading, because the profile is not missing. Set `IRK_EXPORT_PROFILE` to a
 profile name and `beta_internal` exports with manual signing, removing the
 account dependency entirely.
+
+**Analytics do not accrue until you ask.** Apple generates App Store analytics
+only for apps that have an `analyticsReportRequest`. Without one there are no
+impressions, no source types, no download reports — not empty, absent. You find
+out on the day you first want to know where an install came from, which is the
+day it is already too late. Worse, `ONGOING` starts from the moment you ask and
+cannot see backwards; only `ONE_TIME_SNAPSHOT` recovers history. Run
+`analytics_report` when the app record is created, then again with `SNAPSHOT=1`.
+Apple also stops a feed nobody collects from, and the only tell is
+`stoppedDueToInactivity` on the request.
 
 **Both screenshot sets.** `APP_IPHONE_67` (6.9in) is what modern iPhones render
 in search results; `APP_IPHONE_65` is secondary. Writing only one silently
