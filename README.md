@@ -207,6 +207,11 @@ That is why `set_privacy_policy` is a separate lane from `stage`.
 resource. `create_app` registers the bundle id and tells you exactly what to
 click for the rest.
 
+## Support
+
+A lane that failed on your setup, or an App Store Connect state these do not
+handle yet: support@brandonkessinger.com.
+
 ## License
 
 MIT.
