@@ -118,10 +118,13 @@ def signing_xcargs
   # export step; naming it for the archive too is the whole fix.
   [
     base,
+    # Both of these carry spaces and BOTH need quoting. Quoting only the
+    # profile leaves xcodebuild reading "Distribution" as a build action:
+    #   xcodebuild: error: Unknown build action 'Distribution'.
     "CODE_SIGN_STYLE=Manual",
-    "CODE_SIGN_IDENTITY=Apple Distribution",
+    "'CODE_SIGN_IDENTITY=Apple Distribution'",
     "DEVELOPMENT_TEAM=#{team_id}",
-    "PROVISIONING_PROFILE_SPECIFIER='#{profile}'"
+    "'PROVISIONING_PROFILE_SPECIFIER=#{profile}'"
   ].join(" ")
 end
 
