@@ -98,7 +98,31 @@ def signing_xcargs
   # gym injects the API-key auth flags itself from app_store_connect_api_key.
   # Passing them again makes xcodebuild fail with
   # "-authenticationKeyID may only be provided once".
-  "-allowProvisioningUpdates"
+  base = "-allowProvisioningUpdates"
+  profile = export_profile
+  return base if profile.to_s.strip.empty?
+
+  # ARCHIVE with manual signing too, not just export.
+  #
+  # Automatic signing at the archive step resolves to the team's wildcard
+  # profile ("iOS Team Provisioning Profile: *"), which carries no
+  # capabilities. That is invisible until an app declares one -- Game Center,
+  # push, iCloud, HealthKit -- and then the archive fails with the pair:
+  #
+  #   No Accounts: Add a new account in Accounts settings.
+  #   Provisioning profile "iOS Team Provisioning Profile: *" doesn't include
+  #   the Game Center capability.
+  #
+  # which reads as a missing Apple ID and is really a wildcard profile being
+  # asked to do a job it cannot. The correct profile is already named for the
+  # export step; naming it for the archive too is the whole fix.
+  [
+    base,
+    "CODE_SIGN_STYLE=Manual",
+    "CODE_SIGN_IDENTITY=Apple Distribution",
+    "DEVELOPMENT_TEAM=#{team_id}",
+    "PROVISIONING_PROFILE_SPECIFIER='#{profile}'"
+  ].join(" ")
 end
 
 # Export with MANUAL signing and a named profile.
