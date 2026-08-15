@@ -431,6 +431,24 @@ platform :ios do
     state = version.dig("attributes", "appStoreState")
     UI.message("version #{version.dig('attributes', 'versionString')} is #{state}")
 
+    # This lane submits the VERSION ALONE. For an app with products still
+    # waiting on their first approval that is the exact mistake described
+    # above, so refuse rather than reproduce it. `submit_with_iaps` does the
+    # same cancel-and-reattach and carries the products too.
+    #
+    # An app with no products, or whose products are all APPROVED, is
+    # unaffected: the list comes back empty and this never fires.
+    pending = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
+                .reject { |i| i.dig("attributes", "state") == "APPROVED" }
+    if pending.any? && ENV["VERSION_ONLY"].to_s.empty?
+      pending.each { |i| UI.error("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
+      UI.user_error!(
+        "#{pending.count} in-app purchase(s) are not APPROVED. This lane would submit the " \
+        "version WITHOUT them, which is how Lab Tycoon went on sale unable to take money. " \
+        "Use `submit_with_iaps` instead, or set VERSION_ONLY=1 if that really is what you want."
+      )
+    end
+
     subs = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=10")["data"]
     stuck = subs.select { |s| s.dig("attributes", "state") == "UNRESOLVED_ISSUES" }
     if stuck.empty?
@@ -474,30 +492,35 @@ platform :ios do
     UI.user_error!("Version never came free. Re-run in a few minutes.") unless attached
     UI.success("version attached to #{fresh['id']}")
 
-    # Report the products the cancellation freed. This CANNOT be automated here:
-    # reviewSubmissionItems accepts only appStoreVersion, appEvent and
-    # appCustomProductPageVersion, and POSTing an in-app purchase to it returns
-    #   ENTITY_ERROR.RELATIONSHIP.UNKNOWN
-    # while /v1/inAppPurchaseSubmissions refuses a freed product with
-    #   ENTITY_ERROR.RELATIONSHIP.INVALID
-    #   "InAppPurchase <id> has no pending version for submission"
-    # because cancelling consumed the pending version the product had. The
-    # product keeps its metadata and its READY_TO_SUBMIT state, so nothing looks
-    # wrong; it simply has nothing left to submit until it is re-prepared in the
-    # App Store Connect UI.
+    # Report the products this submission does NOT carry.
     #
-    # So this is a loud warning, not a silent gap. Lab Tycoon was approved and
-    # went on sale unable to take money precisely because nothing said this out
-    # loud after the version went in without its products.
+    # CORRECTED 2026-08-15, observed on Lab Tycoon. This block used to claim
+    # cancelling "consumed" each product's pending version, leaving nothing to
+    # submit until it was re-prepared in the App Store Connect UI. That is
+    # wrong, and it sent a whole session down a manual path that did not exist.
+    # What actually happens on cancel:
+    #   - the product returns to READY_TO_SUBMIT on its own, nothing to click
+    #   - its child inAppPurchaseVersion SURVIVES, as DEVELOPER_REJECTED
+    # That child is still the product's inflight version, which is why creating
+    # a replacement earns STATE_ERROR.ALREADY_EXISTS. Attaching it to a fresh
+    # submission revives it, and `submit_with_iaps` already does exactly that.
+    #
+    # The genuine constraint is narrower: reviewSubmissionItems cannot take an
+    # inAppPurchase, only an inAppPurchaseVERSION, and /v1/inAppPurchaseSubmissions
+    # refuses a product whose child is already attached elsewhere.
+    #
+    # Reaching here at all means VERSION_ONLY=1 was set, so this is the warning
+    # that Lab Tycoon never got before going on sale unable to take money.
     freed = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?limit=200")["data"]
               .reject { |i| i.dig("attributes", "state") == "APPROVED" }
     unless freed.empty?
       UI.error("#{freed.count} in-app purchase(s) are NOT part of this submission:")
       freed.each { |i| UI.error("  #{i.dig('attributes', 'productId')}: #{i.dig('attributes', 'state')}") }
-      UI.error("Attach each product's child inAppPurchaseVersion to THIS submission")
-      UI.error("before PATCHing submitted=true: GET /v2/inAppPurchases/{id}/versions,")
-      UI.error("then POST /v1/reviewSubmissionItems with relationship")
-      UI.error("`inAppPurchaseVersion` -> type `inAppPurchaseVersions`.")
+      UI.error("They will NOT be reviewed, and the app can ship unable to take money.")
+      UI.error("`submit_with_iaps` carries them; this lane does not. To do it by hand:")
+      UI.error("GET /v2/inAppPurchases/{id}/versions, take the existing child even if it")
+      UI.error("reads DEVELOPER_REJECTED, then POST /v1/reviewSubmissionItems with")
+      UI.error("relationship `inAppPurchaseVersion` -> type `inAppPurchaseVersions`.")
       UI.error("Verify afterwards with: appstore-doctor --bundle #{app_id}")
     end
 
