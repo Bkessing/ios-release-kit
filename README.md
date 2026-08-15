@@ -169,6 +169,18 @@ misleading, because the profile is not missing. Set `IRK_EXPORT_PROFILE` to a
 profile name and `beta_internal` exports with manual signing, removing the
 account dependency entirely.
 
+**A capability breaks the archive, and the error blames your Apple ID.** The
+archive step signs automatically even though the export names a profile, and
+automatic resolves to the team wildcard, `iOS Team Provisioning Profile: *`,
+which carries no capabilities. Add Game Center, push, iCloud or HealthKit and
+the build dies with `No Accounts: Add a new account in Accounts settings`
+followed by `doesn't include the ... capability`. The first line is a red
+herring; the correct profile is installed and named for a later step. Fix it in
+your app's own target (Release config, manual signing, name the profile) — not
+in this kit's `xcargs`, which apply to every target and are rejected outright by
+SPM package targets. Enable the capability on the App ID *before* cutting the
+profile: a profile only carries what the App ID had when it was created.
+
 **Analytics do not accrue until you ask.** Apple generates App Store analytics
 only for apps that have an `analyticsReportRequest`. Without one there are no
 impressions, no source types, no download reports — not empty, absent. You find

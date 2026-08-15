@@ -98,6 +98,45 @@ def signing_xcargs
   # gym injects the API-key auth flags itself from app_store_connect_api_key.
   # Passing them again makes xcodebuild fail with
   # "-authenticationKeyID may only be provided once".
+  #
+  # KNOWN GAP, and it will bite the first app here that declares a capability.
+  #
+  # This flag means the ARCHIVE signs automatically even though the EXPORT is
+  # manual and names a profile (see export_options). Automatic signing resolves
+  # to the team's wildcard profile, "iOS Team Provisioning Profile: *", which
+  # carries no capabilities. That is invisible until an app asks for one --
+  # Game Center, push, iCloud, HealthKit -- and then the archive dies with:
+  #
+  #     No Accounts: Add a new account in Accounts settings.
+  #     Provisioning profile "iOS Team Provisioning Profile: *" doesn't include
+  #     the Game Center capability.
+  #
+  # The first line sends you hunting for a missing Apple ID. The real problem
+  # is a wildcard profile being asked to do a job it cannot, while the correct
+  # profile sits installed and named for a later step.
+  #
+  # DO NOT FIX IT HERE. Setting CODE_SIGN_STYLE/PROVISIONING_PROFILE_SPECIFIER
+  # in these xcargs was tried (Late Fee, 2026-08-14) and reverted: xcargs apply
+  # to EVERY target in the build, and SPM package targets reject a profile
+  # outright -- "PostHog_PostHog does not support provisioning profiles". It
+  # would have broken every app in this kit that depends on a package.
+  #
+  # Fix it per-target in the APP's own project instead. For an xcodegen
+  # project, in the app target only, Release config only:
+  #
+  #     settings:
+  #       configs:
+  #         Release:
+  #           CODE_SIGN_STYLE: Manual
+  #           CODE_SIGN_IDENTITY: "Apple Distribution"
+  #           PROVISIONING_PROFILE_SPECIFIER: "<your App Store profile>"
+  #
+  # Release only: Debug and simulator builds sign automatically or not at all,
+  # and forcing a distribution identity on them breaks the test runs.
+  #
+  # And enable the capability on the App ID BEFORE cutting the profile -- a
+  # profile only carries what the App ID had at creation time, so doing it
+  # after produces a profile that looks fine and fails export the same way.
   "-allowProvisioningUpdates"
 end
 
