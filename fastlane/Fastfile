@@ -306,13 +306,39 @@ platform :ios do
       UI.important("Editable version already exists: #{v.version_string} (#{v.app_store_state}) — reusing")
     end
 
+    # Apple copies the description and keywords into a new version but NOT the
+    # promotional text, and nothing anywhere reports the loss: the field is
+    # simply blank and the line quietly vanishes from the listing on release.
+    # It has now happened twice, to CardHabit 1.2.1 and Lab Tycoon 1.0.1, and
+    # both were caught by eye rather than by tooling. Carry it forward from the
+    # live version, and never overwrite a value the caller already set.
+    carried = nil
+    begin
+      live = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=20&filter[platform]=IOS")["data"]
+               .find { |x| x.dig("attributes", "appStoreState") == "READY_FOR_SALE" }
+      if live
+        carried = asc_http(:get, "/v1/appStoreVersions/#{live['id']}/appStoreVersionLocalizations?limit=10")["data"]
+                    .find { |l| l.dig("attributes", "locale") == "en-US" }
+                    &.dig("attributes", "promotionalText")
+      end
+    rescue StandardError => e
+      UI.important("could not read the live promotional text: #{e.message}")
+    end
+
     locs = v.get_app_store_version_localizations
     en = locs.find { |l| l.locale == "en-US" } || locs.first
     if en
-      en.update(attributes: { whatsNew: whats_new })
+      attrs = { whatsNew: whats_new }
+      if en.promotional_text.to_s.strip.empty? && !carried.to_s.strip.empty?
+        attrs[:promotionalText] = carried
+        UI.success("carried the promotional text forward from the live version")
+      end
+      en.update(attributes: attrs)
     else
+      attrs = { locale: "en-US", whatsNew: whats_new }
+      attrs[:promotionalText] = carried unless carried.to_s.strip.empty?
       Spaceship::ConnectAPI.post_app_store_version_localization(
-        app_store_version_id: v.id, attributes: { locale: "en-US", whatsNew: whats_new }
+        app_store_version_id: v.id, attributes: attrs
       )
     end
     UI.success("new_version done: #{v.version_string} (#{v.app_store_state})")
