@@ -1223,6 +1223,85 @@ platform :ios do
     UI.important("Share URL once approved: https://apps.apple.com/app/id#{app.id}?ppid=#{page['id']}")
   end
 
+  desc "Upload screenshots to a custom product page. PAGE=<name> SHOTS_DIR=<dir> [SHOT_NAMES=a.png,b.png]"
+  lane :cpp_shots do
+    # Screenshots are the POINT of a custom product page. Varying them and the
+    # promotional text is the only thing a page is allowed to change, so a page
+    # that only changes copy throws away the larger half, and a page with none
+    # is not a product page at all.
+    #
+    # ORDER IS THE PRODUCT. SHOT_NAMES sets it, and the first two are almost the
+    # whole decision: an incremental-games audience wants to see the loop, a
+    # directory reader wants the establishing shot. Same eight files, different
+    # argument.
+    connect!
+    api_key
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    want = ENV["PAGE"].to_s.strip
+    UI.user_error!("Set PAGE=<custom product page name>") if want.empty?
+
+    pages = asc_http(:get, "/v1/apps/#{app.id}/appCustomProductPages?limit=70")["data"] || []
+    page = pages.find { |p| p["attributes"]["name"] == want || p["id"] == want }
+    UI.user_error!("No custom product page named '#{want}'. Run cpp_list.") if page.nil?
+
+    ver = (asc_http(:get, "/v1/appCustomProductPages/#{page['id']}/appCustomProductPageVersions")["data"] || []).first
+    UI.user_error!("Page has no version") if ver.nil?
+    loc = (asc_http(:get, "/v1/appCustomProductPageVersions/#{ver['id']}/appCustomProductPageLocalizations")["data"] || [])
+          .find { |l| l["attributes"]["locale"] == "en-US" }
+    UI.user_error!("Page has no en-US localization") if loc.nil?
+
+    dir = ENV["SHOTS_DIR"].to_s
+    UI.user_error!("SHOTS_DIR not found: #{dir}") unless File.directory?(dir)
+    names = ENV["SHOT_NAMES"].to_s.split(",").map(&:strip).reject(&:empty?)
+    names = Dir.glob(File.join(dir, "*.png")).sort.map { |f| File.basename(f) } if names.empty?
+    files = names.map { |n| File.join(dir, n) }
+    missing = files.reject { |f| File.exist?(f) }
+    UI.user_error!("Missing: #{missing.join(', ')}") if missing.any?
+    UI.user_error!("Apple takes 3 to 10 screenshots; got #{files.length}") unless files.length.between?(3, 10)
+
+    # Apple accepts either the 6.7in or the 6.9in canvas in the APP_IPHONE_67
+    # slot. Lab Tycoon's are 1320x2868, so a guard pinned to 1290x2796 alone
+    # would reject perfectly valid art.
+    ok = ["1290x2796", "1320x2868"]
+    files.each do |f|
+      w, h = File.binread(f, 8, 16).unpack("N2")
+      UI.user_error!("#{File.basename(f)} is #{w}x#{h}; expected one of #{ok.join(' or ')}") unless ok.include?("#{w}x#{h}")
+    end
+
+    UI.message("Page: #{page['attributes']['name']}")
+    files.each_with_index { |f, i| UI.message("  #{i + 1}. #{File.basename(f)}") }
+    if ENV["DRY"] == "1"
+      UI.success("DRY=1, nothing uploaded.")
+      next
+    end
+
+    sets = asc_http(:get, "/v1/appCustomProductPageLocalizations/#{loc['id']}/appScreenshotSets")["data"] || []
+    set = sets.find { |s| s["attributes"]["screenshotDisplayType"] == "APP_IPHONE_67" }
+    if set
+      existing = asc_http(:get, "/v1/appScreenshotSets/#{set['id']}/appScreenshots")["data"] || []
+      existing.each { |s| asc_http(:delete, "/v1/appScreenshots/#{s['id']}") }
+      UI.important("Replaced #{existing.length} existing screenshots")
+    else
+      # Spaceship's post_app_screenshot_set only binds to a VERSION localization,
+      # so the set is created by hand against the custom page localization and
+      # then handed back to Spaceship, whose uploader does the reserve, upload
+      # and commit dance properly.
+      set = asc_http(:post, "/v1/appScreenshotSets", {
+        data: { type: "appScreenshotSets",
+                attributes: { screenshotDisplayType: "APP_IPHONE_67" },
+                relationships: { appCustomProductPageLocalization: {
+                  data: { type: "appCustomProductPageLocalizations", id: loc["id"] } } } }
+      })["data"]
+    end
+
+    model = Spaceship::ConnectAPI::AppScreenshotSet.get(app_screenshot_set_id: set["id"])
+    files.each_with_index do |f, i|
+      model.upload_screenshot(path: f, wait_for_processing: true)
+      UI.message("  uploaded #{i + 1}/#{files.length}: #{File.basename(f)}")
+    end
+    UI.success("#{files.length} screenshots on '#{page['attributes']['name']}'")
+  end
+
   # -------------------------------------------------------------------------
   # Status
   # -------------------------------------------------------------------------
