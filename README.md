@@ -179,7 +179,13 @@ herring; the correct profile is installed and named for a later step. Fix it in
 your app's own target (Release config, manual signing, name the profile) — not
 in this kit's `xcargs`, which apply to every target and are rejected outright by
 SPM package targets. Enable the capability on the App ID *before* cutting the
-profile: a profile only carries what the App ID had when it was created.
+profile: a profile only carries what the App ID had when it was created. And
+once the app's project names a Release profile, that name and
+`IRK_EXPORT_PROFILE` must agree — `beta_internal` checks this before archiving
+and fails with both values printed, because the natural drift (a re-cut
+profile gets a new date-stamped name and only one of the two places is
+updated) otherwise surfaces minutes later wearing the same misleading "No
+Accounts" costume. `IRK_SKIP_PROFILE_CHECK=1` bypasses.
 
 **Analytics do not accrue until you ask.** Apple generates App Store analytics
 only for apps that have an `analyticsReportRequest`. Without one there are no
