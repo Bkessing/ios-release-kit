@@ -1122,6 +1122,107 @@ platform :ios do
     end
   end
 
+  desc "List custom product pages, their versions and states."
+  lane :cpp_list do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    pages = asc_http(:get, "/v1/apps/#{app.id}/appCustomProductPages?limit=70")["data"] || []
+    if pages.empty?
+      UI.important("No custom product pages. 70 slots free.")
+      next
+    end
+    pages.each do |p|
+      a = p["attributes"]
+      UI.message("#{a['name']}  id=#{p['id']}  visible=#{a['visible']}")
+      vers = asc_http(:get, "/v1/appCustomProductPages/#{p['id']}/appCustomProductPageVersions")["data"] || []
+      vers.each do |v|
+        va = v["attributes"]
+        UI.message("   v#{va['version']}  state=#{va['state']}  deepLink=#{va['deepLink']}")
+        UI.message("   URL: https://apps.apple.com/app/id#{app.id}?ppid=#{p['id']}")
+      end
+    end
+  end
+
+  desc "Create a custom product page. NAME= PROMO= (or PROMO_FILE=). DRY=1 to preview."
+  lane :cpp_create do
+    # A custom product page is an alternate version of the SAME listing: you may
+    # vary screenshots, app previews and promotional text, and nothing else. The
+    # name, subtitle, icon, description, price and ratings all stay shared.
+    #
+    # Two reasons to bother. Each page gets a unique URL with its own analytics,
+    # which is the only way to tell a Reddit install from a search install. And
+    # each can carry its own keywords, so it serves those searches INSTEAD of the
+    # default page -- powerful, and the same shape as the keyword change that
+    # took CardHabit from 1,474 impressions a day to zero downloads. Keywords are
+    # deliberately NOT set here; do that deliberately, later, with a baseline.
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    UI.user_error!("No app record for #{app_id}") if app.nil?
+
+    name = ENV["NAME"].to_s.strip
+    UI.user_error!("Set NAME= (internal reference name, not shown to users)") if name.empty?
+
+    promo = ENV["PROMO"]
+    if ENV["PROMO_FILE"].to_s != ""
+      UI.user_error!("PROMO_FILE not found") unless File.exist?(ENV["PROMO_FILE"])
+      promo = File.read(ENV["PROMO_FILE"])
+    end
+    promo = promo.to_s.strip
+    if promo.length > 170
+      UI.user_error!("Promotional text is #{promo.length} characters. Apple's limit is 170.")
+    end
+
+    existing = (asc_http(:get, "/v1/apps/#{app.id}/appCustomProductPages?limit=70")["data"] || [])
+    if existing.any? { |p| p["attributes"]["name"] == name }
+      UI.user_error!("A custom product page named '#{name}' already exists. Names are the handle you will use later; pick another.")
+    end
+    UI.message("Existing pages: #{existing.length} of 70 slots used")
+    UI.message("Would create: #{name}")
+    UI.message("Promotional text (#{promo.length}): #{promo}") unless promo.empty?
+
+    if ENV["DRY"] == "1"
+      UI.success("DRY=1, nothing created.")
+      next
+    end
+
+    # The page, its first version and that version's localization must be
+    # created in ONE request. Creating them in sequence fails with
+    # ENTITY_ERROR.RELATIONSHIP.REQUIRED on both child relationships: Apple will
+    # not accept a page that has no version, or a version with no localization.
+    #
+    # The mechanism is JSON:API compound creation with client-supplied temporary
+    # ids. The "${...}" strings are placeholders Apple resolves server-side and
+    # replaces with real ids; they only have to be unique within the request.
+    vid = "${new-version}"
+    lid = "${new-localization}"
+    body = {
+      data: {
+        type: "appCustomProductPages",
+        attributes: { name: name },
+        relationships: {
+          app: { data: { type: "apps", id: app.id.to_s } },
+          appCustomProductPageVersions: {
+            data: [{ type: "appCustomProductPageVersions", id: vid }]
+          }
+        }
+      },
+      included: [
+        { type: "appCustomProductPageVersions", id: vid,
+          relationships: { appCustomProductPageLocalizations: {
+            data: [{ type: "appCustomProductPageLocalizations", id: lid }] } } },
+        { type: "appCustomProductPageLocalizations", id: lid,
+          attributes: { locale: "en-US",
+                        promotionalText: promo.empty? ? nil : promo }.compact }
+      ]
+    }
+    page = asc_http(:post, "/v1/appCustomProductPages", body)["data"]
+    UI.success("Created page #{page['id']} with its version and en-US localization")
+
+    UI.message("")
+    UI.important("NOT submitted and NOT visible. Next: attach screenshots, then submit for review.")
+    UI.important("Share URL once approved: https://apps.apple.com/app/id#{app.id}?ppid=#{page['id']}")
+  end
+
   # -------------------------------------------------------------------------
   # Status
   # -------------------------------------------------------------------------
