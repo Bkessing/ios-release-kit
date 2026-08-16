@@ -162,6 +162,40 @@ def export_options
   }
 end
 
+# The archive/export profile-mismatch preflight.
+#
+# When the app's project configures MANUAL Release signing with a named
+# profile (the capability fix documented in signing_xcargs above), that name
+# and IRK_EXPORT_PROFILE must agree. When they drift -- a profile gets re-cut
+# with a new date-stamped name and only one of the two places is updated --
+# the failure arrives MINUTES later, at archive or export, wearing the same
+# misleading "No Accounts" costume as every other signing problem (Late Fee,
+# 2026-08-15: project.yml said "...20260814", the Fastfile still said
+# "...20260801").
+#
+# So check BEFORE spending an archive. Only when the project actually names a
+# Release profile: an empty specifier means automatic archive signing, which
+# is the kit's normal flow and exactly what IRK_EXPORT_PROFILE exists for.
+# IRK_SKIP_PROFILE_CHECK=1 overrides, for the setup this heuristic misreads.
+def preflight_profile_match!
+  profile = export_profile
+  return if profile.to_s.strip.empty? || ENV["IRK_SKIP_PROFILE_CHECK"]
+  raw = sh("cd .. && xcodebuild -project #{project} -scheme #{scheme} " \
+           "-configuration Release -showBuildSettings 2>/dev/null " \
+           "| grep -m1 'PROVISIONING_PROFILE_SPECIFIER' || true", log: false)
+  spec = raw.to_s.split("=", 2).last.to_s.strip
+  return if spec.empty? || spec == profile
+  UI.user_error!(<<~MSG)
+    Profile mismatch, caught before the archive instead of after it:
+      project Release PROVISIONING_PROFILE_SPECIFIER = #{spec}
+      IRK_EXPORT_PROFILE                             = #{profile}
+    The archive will sign with the first and the export with the second, and
+    the build will fail with a misleading "No Accounts" error. Point both at
+    the same profile (usually: update IRK_EXPORT_PROFILE in your Fastfile).
+    Set IRK_SKIP_PROFILE_CHECK=1 to bypass if this setup is intentional.
+  MSG
+end
+
 def timestamp_build
   Time.now.strftime("%Y%m%d%H%M")
 end
@@ -276,6 +310,7 @@ platform :ios do
     # xcodegen-managed projects do not commit the .xcodeproj, so regenerate it
     # before building or you build whatever stale file happens to be on disk.
     sh("cd .. && xcodegen generate") if irk("USES_XCODEGEN", required: false).to_s == "true"
+    preflight_profile_match!
     build_number = timestamp_build
     gym(
       project: project,
