@@ -1008,6 +1008,104 @@ platform :ios do
     UI.success("Metadata pushed. Nothing submitted.")
   end
 
+  desc "Set promotional text on the LIVE version. No review, no build. TEXT= or TEXT_FILE=. DRY=1 to preview."
+  lane :promo_text do
+    # Promotional text is the only listing copy Apple lets you change without a
+    # new version and without review. It is 170 characters at the top of the
+    # description and it goes live within minutes, which makes it the one lever
+    # available on a day when everything else is waiting on Apple.
+    #
+    # This lane deliberately targets the LIVE version, not the editable one.
+    # `push_metadata` writes to the edit version, so anything set there sits
+    # unpublished until the next release. That is the opposite of what you want
+    # here and is the mistake this lane exists to prevent.
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    UI.user_error!("No app record for #{app_id}") if app.nil?
+
+    text = ENV["TEXT"]
+    if ENV["TEXT_FILE"].to_s != ""
+      UI.user_error!("TEXT_FILE not found: #{ENV['TEXT_FILE']}") unless File.exist?(ENV["TEXT_FILE"])
+      text = File.read(ENV["TEXT_FILE"])
+    end
+    UI.user_error!("Set TEXT= or TEXT_FILE=") if text.to_s.strip.empty?
+    text = text.strip
+
+    # Apple truncates silently past 170 rather than erroring, so the sentence
+    # you spent an hour on loses its ending and nobody tells you.
+    if text.length > 170
+      UI.user_error!("Promotional text is #{text.length} characters. Apple's limit is 170.")
+    end
+
+    live = app.get_live_app_store_version
+    UI.user_error!("No live version. Promotional text only publishes on a live app.") if live.nil?
+
+    # The guard, and it is narrower than it first looks.
+    #
+    # What is actually dangerous is editing the version record a submission is
+    # HOLDING. It is not dangerous to edit a different version that happens to
+    # be live at the same time, and those are routinely both true at once: a
+    # 1.0.1 can sit in review while 1.0 is the live version you are editing.
+    #
+    # A version that is READY_FOR_SALE is by definition not the one under
+    # review, so that state is the check. An earlier version of this lane
+    # blocked on "any pending submission exists", which refused a completely
+    # safe edit and taught the operator to reach for FORCE. A guard that cries
+    # wolf is worse than no guard.
+    unless live.app_store_state == "READY_FOR_SALE"
+      unless ENV["FORCE"] == "1"
+        UI.user_error!(
+          "Live version #{live.version_string} is #{live.app_store_state}, not READY_FOR_SALE.\n" \
+          "A submission may be holding this exact record, and editing it risks the submission.\n" \
+          "Wait for it to clear, or set FORCE=1 if you are certain."
+        )
+      end
+      UI.important("FORCE=1: editing a #{live.app_store_state} version.")
+    end
+
+    # Not a blocker, but the operator needs to hear it: a version waiting in
+    # review carries its OWN promotional text, and publishes it on release.
+    # Setting this on the live version now buys you the days until then, and
+    # then it is silently replaced by whatever the pending version holds.
+    begin
+      pending = app.get_app_store_versions.reject { |v| v.app_store_state == "READY_FOR_SALE" }
+      pending.each do |v|
+        UI.important(
+          "Heads up: #{v.version_string} is #{v.app_store_state} and carries its own " \
+          "promotional text. When it releases it will overwrite what you are setting now. " \
+          "Re-run this lane after that release."
+        )
+      end
+    rescue => e
+      UI.important("Could not list other versions (#{e.class}).")
+    end
+
+    loc = live.get_app_store_version_localizations.find { |l| l.locale == "en-US" }
+    UI.user_error!("No en-US localization on the live version") if loc.nil?
+
+    UI.message("Live version: #{live.version_string}")
+    UI.message("Before (#{loc.promotional_text.to_s.length}): #{loc.promotional_text}")
+    UI.message("After  (#{text.length}): #{text}")
+
+    if ENV["DRY"] == "1"
+      UI.success("DRY=1, nothing written.")
+      next
+    end
+
+    loc.update(attributes: { promotionalText: text })
+
+    # Read it back. A write that reports success and did not land is the failure
+    # mode this whole kit exists to catch.
+    check = app.get_live_app_store_version
+                .get_app_store_version_localizations
+                .find { |l| l.locale == "en-US" }
+    if check.promotional_text.to_s.strip == text
+      UI.success("Promotional text is live on #{live.version_string} (#{text.length} chars).")
+    else
+      UI.user_error!("Wrote it, but the read-back does not match. Check App Store Connect.")
+    end
+  end
+
   # -------------------------------------------------------------------------
   # Status
   # -------------------------------------------------------------------------
