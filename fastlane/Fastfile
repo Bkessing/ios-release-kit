@@ -1037,8 +1037,18 @@ platform :ios do
       UI.user_error!("Promotional text is #{text.length} characters. Apple's limit is 170.")
     end
 
-    live = app.get_live_app_store_version
-    UI.user_error!("No live version. Promotional text only publishes on a live app.") if live.nil?
+    # Default to the live version, because that is the case this lane exists
+    # for. VERSION= targets a specific one, which is what you want when a
+    # release is already queued: a pending version carries its own promotional
+    # text and publishes it on release, so setting it only on the live version
+    # means the copy reverts the moment the queue moves.
+    if ENV["VERSION"].to_s != ""
+      live = app.get_app_store_versions.find { |v| v.version_string == ENV["VERSION"] }
+      UI.user_error!("No version #{ENV['VERSION']} on this app") if live.nil?
+    else
+      live = app.get_live_app_store_version
+      UI.user_error!("No live version. Promotional text only publishes on a live app.") if live.nil?
+    end
 
     # The guard, and it is narrower than it first looks.
     #
@@ -1055,12 +1065,17 @@ platform :ios do
     unless live.app_store_state == "READY_FOR_SALE"
       unless ENV["FORCE"] == "1"
         UI.user_error!(
-          "Live version #{live.version_string} is #{live.app_store_state}, not READY_FOR_SALE.\n" \
+          "Version #{live.version_string} is #{live.app_store_state}, not READY_FOR_SALE.\n" \
           "A submission may be holding this exact record, and editing it risks the submission.\n" \
           "Wait for it to clear, or set FORCE=1 if you are certain."
         )
       end
-      UI.important("FORCE=1: editing a #{live.app_store_state} version.")
+      # Known to work, once: Lab Tycoon 1.0.1's promotional text was edited on
+      # 2026-08-15 while it sat in WAITING_FOR_REVIEW, and the submission came
+      # through unharmed. One instance is precedent, not a guarantee, so verify
+      # the submission's item states after this runs rather than assuming.
+      UI.important("FORCE=1: editing #{live.version_string}, which is #{live.app_store_state}.")
+      UI.important("Check the submission's items afterwards. This is the case the guard exists for.")
     end
 
     # Not a blocker, but the operator needs to hear it: a version waiting in
@@ -1068,12 +1083,13 @@ platform :ios do
     # Setting this on the live version now buys you the days until then, and
     # then it is silently replaced by whatever the pending version holds.
     begin
-      pending = app.get_app_store_versions.reject { |v| v.app_store_state == "READY_FOR_SALE" }
-      pending.each do |v|
+      app.get_app_store_versions
+         .reject { |v| v.app_store_state == "READY_FOR_SALE" || v.id == live.id }
+         .each do |v|
         UI.important(
           "Heads up: #{v.version_string} is #{v.app_store_state} and carries its own " \
           "promotional text. When it releases it will overwrite what you are setting now. " \
-          "Re-run this lane after that release."
+          "Set it there too with VERSION=#{v.version_string} FORCE=1, or re-run after release."
         )
       end
     rescue => e
