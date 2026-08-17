@@ -808,6 +808,23 @@ platform :ios do
       next
     end
 
+    # A rejection leaves the old submission in UNRESOLVED_ISSUES, still
+    # holding the version. Nothing can attach that version anywhere while it
+    # lives, so the retry loop below spins to exhaustion and dies with
+    # "Version never came free" -- which is how this lane failed on Lab
+    # Tycoon's third rejection (2026-08-17). Cancel the corpse first; that is
+    # the documented resubmit path (a Resolution Center reply is not a
+    # resubmission, and neither is anything else while the dead submission
+    # holds the items).
+    asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+      .select { |s| s.dig("attributes", "state") == "UNRESOLVED_ISSUES" }
+      .each do |s|
+        asc_http(:patch, "/v1/reviewSubmissions/#{s['id']}", {
+          "data" => { "type" => "reviewSubmissions", "id" => s["id"],
+                      "attributes" => { "canceled" => true } } })
+        UI.important("cancelled stuck submission #{s['id']} (UNRESOLVED_ISSUES)")
+      end
+
     # An itemless READY_FOR_REVIEW submission is reused rather than orphaned;
     # opening a second one while it exists earns ITEM_PART_OF_ANOTHER_SUBMISSION.
     # Reuse ANY unsubmitted submission, not just an itemless one. A partially
