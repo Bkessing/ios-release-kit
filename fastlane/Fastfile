@@ -474,6 +474,22 @@ platform :ios do
     UI.success("Attached build #{build_number} to version #{v.version_string}")
   end
 
+  desc "Answer the IDFA question on the editable version. USES_IDFA=true|false (default false)"
+  # Apple blocks submission on an unanswered IDFA question less often than it
+  # should, and an unanswered one reads as a null on the API. If the app links
+  # no ad SDK and imports neither AdSupport nor ATTrackingManager, the honest
+  # answer is false. This is a statement to Apple: check before declaring.
+  lane :set_idfa do
+    api_key
+    uses = ENV["USES_IDFA"].to_s.strip.downcase == "true"
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version or UI.user_error!("No editable version")
+    asc_http(:patch, "/v1/appStoreVersions/#{v.id}",
+             { data: { type: "appStoreVersions", id: v.id,
+                       attributes: { usesIdfa: uses } } })
+    UI.success("usesIdfa=#{uses} on #{v.version_string}")
+  end
+
   desc "Set release type. RELEASE_TYPE=AFTER_APPROVAL|MANUAL|SCHEDULED"
   lane :set_release_type do
     api_key
