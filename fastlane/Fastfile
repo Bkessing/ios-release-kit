@@ -1473,19 +1473,29 @@ platform :ios do
     v = app.get_edit_app_store_version
     UI.user_error!("No editable version") if v.nil?
 
-    support_file = "fastlane/metadata/en-US/support_url.txt"
-    if File.exist?(support_file)
+    # Fastlane executes the Fastfile from inside fastlane/, so a path that
+    # starts with "fastlane/" resolves to fastlane/fastlane/... and silently
+    # misses. This lane shipped that way and, worse than doing nothing, it
+    # PATCHED notes to "" when the file was not found -- it erased the review
+    # notes Lab Tycoon had on 2026-08-17. Look in both places, and never
+    # overwrite existing notes with emptiness.
+    metadata_path = lambda do |rel|
+      ["metadata/#{rel}", "fastlane/metadata/#{rel}"].find { |p| File.exist?(p) }
+    end
+
+    support_file = metadata_path.call("en-US/support_url.txt")
+    if support_file
       support = File.read(support_file).strip
       v.get_app_store_version_localizations.each { |loc| loc.update(attributes: { supportUrl: support }) }
     end
 
-    notes_file = "fastlane/metadata/review_notes.txt"
+    notes_file = metadata_path.call("review_notes.txt")
     review_attrs = {
       contactFirstName: contact_first, contactLastName: contact_last,
       contactPhone: contact_phone, contactEmail: contact_email,
       demoAccountRequired: false,
-      notes: (File.exist?(notes_file) ? File.read(notes_file) : "")
     }
+    review_attrs[:notes] = File.read(notes_file) if notes_file
     d = (v.fetch_app_store_review_detail rescue nil)
     d ? d.update(attributes: review_attrs) : v.create_app_store_review_detail(attributes: review_attrs)
     UI.success("Staged support URL and review info. Submission is a separate lane.")
