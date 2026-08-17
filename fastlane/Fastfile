@@ -1738,4 +1738,122 @@ platform :ios do
       UI.user_error!("asc_check failed the Guideline 3.1.2 metadata guard") if ENV["STRICT"]
     end
   end
+
+  # -------------------------------------------------------------------------
+  # Customer reviews
+  # -------------------------------------------------------------------------
+
+  desc "List recent customer reviews. LIMIT=20"
+  lane :reviews do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    UI.user_error!("No app record for #{app_id}") if app.nil?
+
+    limit = (ENV["LIMIT"] || "20").to_i
+    data = asc_http(:get, "/v1/apps/#{app.id}/customerReviews?sort=-createdDate&limit=#{limit}&include=response")
+    list = data["data"] || []
+
+    if list.empty?
+      UI.important("No customer reviews yet.")
+      next
+    end
+
+    counts = Hash.new(0)
+    list.each do |r|
+      a = r["attributes"]
+      rating = a["rating"].to_i
+      counts[rating] += 1
+
+      stars = ("*" * rating) + ("-" * (5 - rating))
+      body = a["body"].to_s.gsub(/\s+/, " ").strip
+      body = body[0, 200] + "..." if body.length > 200
+
+      # `relationships.response.data` is present (non-nil) exactly when a
+      # developer response exists -- the review carries the pointer itself,
+      # no need to cross-reference the `included` array the way you would
+      # for a many-relationship.
+      has_response = !r.dig("relationships", "response", "data").nil?
+
+      UI.message("[#{stars}] #{rating}/5  #{a['territory']}  #{a['createdDate']}  \"#{a['reviewerNickname']}\"  id=#{r['id']}")
+      UI.message("  #{body}")
+      UI.message(has_response ? "  developer response: yes" : "  developer response: no")
+      UI.message("")
+    end
+
+    summary = counts.sort_by { |rating, _| -rating }.map { |rating, n| "#{rating}*:#{n}" }.join("  ")
+    UI.success("#{list.length} review(s) in this page (LIMIT=#{limit}). By rating: #{summary}")
+  end
+
+  desc "Post a developer response to a review. REVIEW_ID= and BODY= or BODY_FILE=. REPLACE=1 to overwrite an existing response. DRY=1 to preview."
+  # Apple's customer review response resource has no PATCH -- the API models
+  # a response as create/delete only, so "editing" a reply means deleting the
+  # existing one and creating a fresh one. That is invisible until you go
+  # looking for an update verb to fix a typo and there is none.
+  #
+  # REVIEW_ID is required rather than searched for, because the failure mode
+  # of guessing wrong is a public reply landing on the wrong customer's
+  # review. Printing the review's own text back before posting -- via a GET
+  # done here, not trusted from a stale list -- is the guard against that,
+  # not a nicety.
+  lane :reply_review do
+    connect!
+    review_id = ENV["REVIEW_ID"].to_s.strip
+    UI.user_error!("Set REVIEW_ID= (run `reviews` to find one)") if review_id.empty?
+
+    body = ENV["BODY"]
+    if ENV["BODY_FILE"].to_s != ""
+      UI.user_error!("BODY_FILE not found: #{ENV['BODY_FILE']}") unless File.exist?(ENV["BODY_FILE"])
+      body = File.read(ENV["BODY_FILE"])
+    end
+    UI.user_error!("Set BODY= or BODY_FILE=") if body.to_s.strip.empty?
+    body = body.strip
+
+    # Apple's limit on a review response body.
+    if body.length > 6000
+      UI.user_error!("Response is #{body.length} characters. Apple's limit is 6000.")
+    end
+
+    review = asc_http(:get, "/v1/customerReviews/#{review_id}?include=response")
+    r = review["data"]
+    UI.user_error!("No review #{review_id}") if r.nil?
+    a = r["attributes"]
+
+    UI.message("Replying to:")
+    UI.message("  #{a['rating']}/5  #{a['territory']}  #{a['createdDate']}  \"#{a['reviewerNickname']}\"")
+    UI.message("  #{a['body']}")
+    UI.message("")
+    UI.message("Response (#{body.length} chars):")
+    UI.message("  #{body}")
+    UI.message("")
+
+    existing = r.dig("relationships", "response", "data")
+    if existing
+      unless ENV["REPLACE"] == "1"
+        UI.user_error!(
+          "This review already has a developer response (id=#{existing['id']}).\n" \
+          "There is no update verb on this resource -- set REPLACE=1 to delete it and post the new one."
+        )
+      end
+      if ENV["DRY"] == "1"
+        UI.important("DRY=1: would delete existing response #{existing['id']}, then post the new one.")
+      else
+        asc_http(:delete, "/v1/customerReviewResponses/#{existing['id']}")
+        UI.important("Deleted existing response #{existing['id']}.")
+      end
+    end
+
+    if ENV["DRY"] == "1"
+      UI.success("DRY=1, nothing posted.")
+      next
+    end
+
+    posted = asc_http(:post, "/v1/customerReviewResponses", {
+      "data" => {
+        "type" => "customerReviewResponses",
+        "attributes" => { "responseBody" => body },
+        "relationships" => { "review" => { "data" => { "type" => "customerReviews", "id" => review_id } } }
+      }
+    })["data"]
+    UI.success("Posted response #{posted['id']} to review #{review_id}.")
+  end
 end

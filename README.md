@@ -169,6 +169,13 @@ surfacing later as a confusing Apple error.
 | `build_status` | processing and TestFlight state of recent uploads |
 | `asc_check` | pre-submission guard: version state, screenshots, 3.1.2 metadata |
 
+**Customer reviews**
+
+| Lane | Does |
+|---|---|
+| `reviews` | list recent customer reviews, ratings and whether each has a reply |
+| `reply_review` | post a developer response. `REPLACE=1` to overwrite an existing one |
+
 ## The failures these encode
 
 **Manual signing at export.** Automatic signing needs an Apple ID signed into
