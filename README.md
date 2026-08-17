@@ -36,7 +36,7 @@ diagnosis when something fails. This repo does; that one reads.
 
 | | | |
 |---|---|---|
-| [ios-bootstrapper](https://github.com/kessinger-tools/ios-bootstrapper) | build the app | paid |
+| [ios-bootstrapper](https://brandonkessinger.com/tools/) | build the app | $49 founder |
 | [ios-release-kit](https://github.com/Bkessing/ios-release-kit) | ship it | free |
 | [appstore-doctor](https://github.com/Bkessing/appstore-doctor) | diagnose it | free |
 
@@ -47,6 +47,15 @@ on update, analytics you can filter your own traffic out of, and the purchase an
 crash-reporting wiring already done.
 
 ## Install both
+
+The short way, with the [skills CLI](https://skills.sh):
+
+```bash
+npx skills add Bkessing/appstore-doctor
+npx skills add Bkessing/ios-release-kit
+```
+
+Or by hand:
 
 These are two halves of one job: this one writes, the other reads. Install the
 pair and Claude picks whichever the moment calls for.
