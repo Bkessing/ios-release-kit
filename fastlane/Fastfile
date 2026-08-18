@@ -1631,6 +1631,8 @@ platform :ios do
     end
     UI.message("Creating availability across #{territories.count} territories")
 
+    # The relationship alone 409s: v2 expects every territoryAvailability as a
+    # full resource in "included", carrying its own available=true attribute.
     asc_http(:post, "/v2/appAvailabilities", {
       "data" => {
         "type" => "appAvailabilities",
@@ -1641,6 +1643,11 @@ platform :ios do
             "data" => territories.map { |id| { "type" => "territoryAvailabilities", "id" => id } }
           }
         }
+      },
+      "included" => territories.map { |id|
+        { "type" => "territoryAvailabilities", "id" => id,
+          "attributes" => { "available" => true },
+          "relationships" => { "territory" => { "data" => { "type" => "territories", "id" => id } } } }
       }
     })
     UI.success("Availability created across #{territories.count} territories.")
