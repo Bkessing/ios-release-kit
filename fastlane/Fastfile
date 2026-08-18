@@ -1133,10 +1133,16 @@ platform :ios do
 
   desc "Push fastlane/metadata/ to the editable version. Submits nothing."
   lane :push_metadata do
+    # Same path-relativity trap as the stage lane: fastlane executes from
+    # inside fastlane/, so "fastlane/metadata" resolves only when run from the
+    # repo root. Look in both places and fail loudly instead of letting
+    # deliver force-push emptiness.
+    md = ["metadata", "fastlane/metadata"].find { |d| Dir.exist?(d) }
+    UI.user_error!("No metadata directory found (looked in metadata/ and fastlane/metadata/)") if md.nil?
     deliver(
       api_key: api_key,
       app_identifier: app_id,
-      metadata_path: "fastlane/metadata",
+      metadata_path: md,
       skip_binary_upload: true,
       skip_screenshots: true,
       force: true,
