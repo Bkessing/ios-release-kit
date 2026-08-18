@@ -1132,6 +1132,50 @@ platform :ios do
   end
 
   desc "Push fastlane/metadata/ to the editable version. Submits nothing."
+  desc "Push en-US store copy via direct API PATCHes. Bypasses deliver, which dies with 'No data' on first-version apps (fastlane#20538)."
+  # Reads the same fastlane/metadata/en-US files as push_metadata. Only ever
+  # writes a field whose file EXISTS AND IS NON-EMPTY -- absent means "leave
+  # alone", never "erase" (the review-notes lesson).
+  lane :push_copy do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    md = ["metadata/en-US", "fastlane/metadata/en-US"].find { |d| Dir.exist?(d) }
+    UI.user_error!("No metadata/en-US directory") if md.nil?
+    read = lambda do |f|
+      path = File.join(md, f)
+      File.exist?(path) ? File.read(path).strip : nil
+    end
+    read_field = lambda { |f| v = read.call(f); (v && !v.empty?) ? v : nil }
+
+    if (subtitle = read_field.call("subtitle.txt"))
+      info = asc_http(:get, "/v1/apps/#{app.id}/appInfos")["data"]
+               .find { |i| %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED READY_FOR_REVIEW].include?(i.dig("attributes", "appStoreState")) } ||
+             asc_http(:get, "/v1/apps/#{app.id}/appInfos")["data"].first
+      loc = asc_http(:get, "/v1/appInfos/#{info['id']}/appInfoLocalizations")["data"]
+              .find { |l| l.dig("attributes", "locale") == "en-US" }
+      asc_http(:patch, "/v1/appInfoLocalizations/#{loc['id']}",
+               { "data" => { "type" => "appInfoLocalizations", "id" => loc["id"],
+                             "attributes" => { "subtitle" => subtitle } } })
+      UI.success("subtitle set (#{subtitle.length} chars)")
+    end
+
+    v = app.get_edit_app_store_version or UI.user_error!("No editable version")
+    loc = asc_http(:get, "/v1/appStoreVersions/#{v.id}/appStoreVersionLocalizations")["data"]
+            .find { |l| l.dig("attributes", "locale") == "en-US" }
+    attrs = {}
+    { "description" => "description.txt", "keywords" => "keywords.txt",
+      "promotionalText" => "promotional_text.txt", "supportUrl" => "support_url.txt",
+      "marketingUrl" => "marketing_url.txt" }.each do |field, file|
+      val = read_field.call(file)
+      attrs[field] = val if val
+    end
+    UI.user_error!("Nothing to push") if attrs.empty?
+    asc_http(:patch, "/v1/appStoreVersionLocalizations/#{loc['id']}",
+             { "data" => { "type" => "appStoreVersionLocalizations", "id" => loc["id"],
+                           "attributes" => attrs } })
+    UI.success("version copy set: #{attrs.keys.join(', ')}")
+  end
+
   lane :push_metadata do
     # Same path-relativity trap as the stage lane: fastlane executes from
     # inside fastlane/, so "fastlane/metadata" resolves only when run from the
