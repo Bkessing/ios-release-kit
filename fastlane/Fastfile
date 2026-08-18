@@ -1640,12 +1640,12 @@ platform :ios do
         "relationships" => {
           "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } },
           "territoryAvailabilities" => {
-            "data" => territories.map { |id| { "type" => "territoryAvailabilities", "id" => id } }
+            "data" => territories.map { |id| { "type" => "territoryAvailabilities", "id" => "${ta-#{id}}" } }
           }
         }
       },
       "included" => territories.map { |id|
-        { "type" => "territoryAvailabilities", "id" => id,
+        { "type" => "territoryAvailabilities", "id" => "${ta-#{id}}",
           "attributes" => { "available" => true },
           "relationships" => { "territory" => { "data" => { "type" => "territories", "id" => id } } } }
       }
