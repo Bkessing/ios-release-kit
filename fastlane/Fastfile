@@ -1440,6 +1440,61 @@ platform :ios do
     UI.success("#{files.length} screenshots on '#{page['attributes']['name']}'")
   end
 
+  desc "Submit every custom product page awaiting review. DRY=1 to preview."
+  # CPPs ride the same reviewSubmission rails as versions and IAPs; the item
+  # relationship is `appCustomProductPageVersion`. Only run once the app
+  # version itself is READY_FOR_SALE -- a second open submission while one is
+  # queued is the ITEM_PART_OF_ANOTHER_SUBMISSION class that has cost this
+  # account 27 days across two apps.
+  lane :cpp_submit do
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    dry = !ENV["DRY"].to_s.empty?
+
+    pages = asc_http(:get, "/v1/apps/#{app.id}/appCustomProductPages?limit=50")["data"] || []
+    pending = []
+    pages.each do |pg|
+      vers = asc_http(:get, "/v1/appCustomProductPages/#{pg['id']}/appCustomProductPageVersions?limit=10")["data"] || []
+      v = vers.find { |x| x.dig("attributes", "state") == "PREPARE_FOR_SUBMISSION" }
+      pending << { name: pg.dig("attributes", "name"), id: v["id"] } if v
+    end
+    UI.user_error!("No custom product pages in PREPARE_FOR_SUBMISSION") if pending.empty?
+    pending.each { |x| UI.message("  #{x[:name]} (#{x[:id]})") }
+    if dry
+      UI.important("DRY=1 -- would submit #{pending.count} page(s)")
+      next
+    end
+
+    blocking = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+                 .select { |x| %w[WAITING_FOR_REVIEW IN_REVIEW UNRESOLVED_ISSUES].include?(x.dig("attributes", "state")) }
+    UI.user_error!("Another submission is inflight (#{blocking.first.dig('attributes','state')}); not opening a second") unless blocking.empty?
+
+    existing = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+                 .find { |x| x.dig("attributes", "state") == "READY_FOR_REVIEW" }
+    sub = existing || asc_http(:post, "/v1/reviewSubmissions", {
+      "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
+                  "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
+    })["data"]
+    UI.message(existing ? "reusing submission #{sub['id']}" : "created submission #{sub['id']}")
+
+    pending.each do |x|
+      asc_http(:post, "/v1/reviewSubmissionItems", {
+        "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+          "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => sub["id"] } },
+          "appCustomProductPageVersion" => { "data" => { "type" => "appCustomProductPageVersions", "id" => x[:id] } } } }
+      })
+      UI.success("attached #{x[:name]}")
+    end
+
+    items = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}/items?limit=50")["data"]
+    UI.user_error!("Submission has no items -- refusing to submit") if items.empty?
+    asc_http(:patch, "/v1/reviewSubmissions/#{sub['id']}",
+             { "data" => { "type" => "reviewSubmissions", "id" => sub["id"],
+                           "attributes" => { "submitted" => true } } })
+    state = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}").dig("data", "attributes", "state")
+    UI.success("submitted #{pending.count} page(s). state=#{state}")
+  end
+
   # -------------------------------------------------------------------------
   # Status
   # -------------------------------------------------------------------------
