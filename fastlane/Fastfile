@@ -490,6 +490,32 @@ platform :ios do
     UI.success("usesIdfa=#{uses} on #{v.version_string}")
   end
 
+  desc "Set content rights + version copyright. COPYRIGHT=\"2026 Studio\" THIRD_PARTY=true|false (default false)"
+  # Two fields every submission needs and every new app record lacks. The
+  # content-rights declaration lives on the APP; copyright lives on the
+  # editable VERSION. Both are one-line PATCHes, so they always ended up as
+  # /tmp scripts -- this lane is their home.
+  lane :asc_finalize do
+    api_key
+    third_party = ENV["THIRD_PARTY"].to_s.strip.downcase == "true"
+    copyright = ENV["COPYRIGHT"].to_s.strip
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    asc_http(:patch, "/v1/apps/#{app.id}",
+             { data: { type: "apps", id: app.id.to_s,
+                       attributes: { contentRightsDeclaration:
+                         third_party ? "USES_THIRD_PARTY_CONTENT" : "DOES_NOT_USE_THIRD_PARTY_CONTENT" } } })
+    UI.success("contentRightsDeclaration=#{third_party ? "USES" : "DOES_NOT_USE"}_THIRD_PARTY_CONTENT")
+    if copyright.empty?
+      UI.important("COPYRIGHT not set; skipped the version copyright field")
+    else
+      v = app.get_edit_app_store_version or UI.user_error!("No editable version for copyright")
+      asc_http(:patch, "/v1/appStoreVersions/#{v.id}",
+               { data: { type: "appStoreVersions", id: v.id,
+                         attributes: { copyright: copyright } } })
+      UI.success("copyright=\"#{copyright}\" on #{v.version_string}")
+    end
+  end
+
   desc "Set release type. RELEASE_TYPE=AFTER_APPROVAL|MANUAL|SCHEDULED"
   lane :set_release_type do
     api_key
