@@ -980,6 +980,121 @@ platform :ios do
   # display name, description or review screenshot, so submitting them earns a
   # rejection that also holds up the products that were ready. Complete them or
   # delete them; do not sweep them in here.
+  desc "Create an IAP end to end: PRODUCT_ID + DISPLAY + DESC + PRICE (TYPE=NON_CONSUMABLE)."
+  # Creating an IAP in the ASC UI is five separate screens, and skipping any of
+  # them (localization, price, availability) parks the product in
+  # MISSING_METADATA, where submit_iaps must refuse it. Worse, a product that
+  # exists in ASC but is half-configured looks EXACTLY like a StoreKit bug from
+  # the app: Product.products(for:) on a device loads from ASC by bundle id, so
+  # the missing product renders as an eternal "…" price. This lane does all
+  # five screens in one shot and is idempotent: rerunning fills whatever piece
+  # is missing instead of erroring on the existing product.
+  lane :create_iap do |options|
+    product_id = (options[:product_id] || ENV["PRODUCT_ID"]).to_s.strip
+    display    = (options[:display]    || ENV["DISPLAY"]).to_s.strip
+    desc_text  = (options[:desc]       || ENV["DESC"]).to_s.strip
+    price      = (options[:price]      || ENV["PRICE"]).to_s.strip
+    kind       = (options[:type]       || ENV["TYPE"] || "NON_CONSUMABLE").to_s.strip
+    ref_name   = (options[:ref_name]   || ENV["REF_NAME"] || display).to_s.strip
+    UI.user_error!("PRODUCT_ID, DISPLAY, DESC and PRICE are all required") if [product_id, display, desc_text, price].any?(&:empty?)
+    # Apple's hard limits; the API error for these is an unhelpful 409.
+    UI.user_error!("IAP display name over 30 chars (#{display.length})") if display.length > 30
+    UI.user_error!("IAP description over 45 chars (#{desc_text.length})") if desc_text.length > 45
+
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+
+    existing = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?filter[productId]=#{product_id}")["data"]
+    if existing.any?
+      iap_id = existing.first["id"]
+      UI.important("#{product_id} already exists (state #{existing.first.dig('attributes', 'state')}); filling gaps")
+    else
+      created = asc_http(:post, "/v2/inAppPurchases", {
+        "data" => { "type" => "inAppPurchases",
+                    "attributes" => { "name" => ref_name, "productId" => product_id,
+                                      "inAppPurchaseType" => kind },
+                    "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
+      })
+      iap_id = created.dig("data", "id")
+      UI.success("Created #{kind} #{product_id} (#{iap_id})")
+    end
+
+    locs = asc_http(:get, "/v2/inAppPurchases/#{iap_id}/inAppPurchaseLocalizations?limit=10")["data"]
+    if locs.any? { |l| l.dig("attributes", "locale") == "en-US" }
+      UI.message("en-US localization already present")
+    else
+      asc_http(:post, "/v1/inAppPurchaseLocalizations", {
+        "data" => { "type" => "inAppPurchaseLocalizations",
+                    "attributes" => { "locale" => "en-US", "name" => display, "description" => desc_text },
+                    "relationships" => { "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap_id } } } }
+      })
+      UI.success("Localized en-US: #{display}")
+    end
+
+    # Price: find the USA price point matching the asked price, then schedule it
+    # as the manual base price everywhere.
+    point_id = nil
+    page = "/v2/inAppPurchases/#{iap_id}/pricePoints?filter[territory]=USA&limit=200"
+    while page && point_id.nil?
+      body = asc_http(:get, page.sub("https://api.appstoreconnect.apple.com", ""))
+      hit = body["data"].find { |p| p.dig("attributes", "customerPrice") == price }
+      point_id = hit && hit["id"]
+      page = body.dig("links", "next")
+    end
+    UI.user_error!("No USA price point at #{price} — check the tier list") if point_id.nil?
+
+    sched = begin
+      asc_http(:get, "/v2/inAppPurchases/#{iap_id}/iapPriceSchedule")
+    rescue FastlaneCore::Interface::FastlaneError
+      nil
+    end
+    if sched && sched["data"]
+      UI.message("Price schedule already present")
+    else
+      asc_http(:post, "/v1/inAppPurchasePriceSchedules", {
+        "data" => { "type" => "inAppPurchasePriceSchedules",
+                    "relationships" => {
+                      "inAppPurchase" => { "data" => { "type" => "inAppPurchases", "id" => iap_id } },
+                      "baseTerritory" => { "data" => { "type" => "territories", "id" => "USA" } },
+                      "manualPrices" => { "data" => [{ "type" => "inAppPurchasePrices", "id" => "${price1}" }] } } },
+        "included" => [{ "type" => "inAppPurchasePrices", "id" => "${price1}",
+                         "attributes" => { "startDate" => nil },
+                         "relationships" => { "inAppPurchasePricePoint" => {
+                           "data" => { "type" => "inAppPurchasePricePoints", "id" => point_id } } } }]
+      })
+      UI.success("Priced at #{price} (USA base, point #{point_id})")
+    end
+
+    avail = begin
+      asc_http(:get, "/v2/inAppPurchases/#{iap_id}/inAppPurchaseAvailability")
+    rescue FastlaneCore::Interface::FastlaneError
+      nil
+    end
+    if avail && avail["data"]
+      UI.message("Availability already present")
+    else
+      territories = []
+      tpage = "/v1/territories?limit=200"
+      while tpage
+        body = asc_http(:get, tpage.sub("https://api.appstoreconnect.apple.com", ""))
+        territories += body["data"].map { |t| t["id"] }
+        tpage = body.dig("links", "next")
+      end
+      asc_http(:post, "/v1/inAppPurchaseAvailabilities", {
+        "data" => { "type" => "inAppPurchaseAvailabilities",
+                    "attributes" => { "availableInNewTerritories" => true },
+                    "relationships" => {
+                      "inAppPurchase" => { "data" => { "type" => "inAppPurchases", "id" => iap_id } },
+                      "availableTerritories" => {
+                        "data" => territories.map { |t| { "type" => "territories", "id" => t } } } } }
+      })
+      UI.success("Available in #{territories.count} territories")
+    end
+
+    state = asc_http(:get, "/v2/inAppPurchases/#{iap_id}")["data"].dig("attributes", "state")
+    UI.success("#{product_id}: #{state}. A review screenshot is still needed before submit_iaps.")
+  end
+
   lane :submit_iaps do
     connect!
     app = Spaceship::ConnectAPI::App.find(app_id)
