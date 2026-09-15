@@ -1095,6 +1095,94 @@ platform :ios do
     UI.success("#{product_id}: #{state}. A review screenshot is still needed before submit_iaps.")
   end
 
+  desc "Add a localization to an IAP listing: PRODUCT_ID + LOCALE + DISPLAY + DESC."
+  lane :iap_localize do |options|
+    product_id = (options[:product_id] || ENV["PRODUCT_ID"]).to_s.strip
+    locale     = (options[:locale]     || ENV["LOCALE"]).to_s.strip
+    display    = (options[:display]    || ENV["DISPLAY"]).to_s.strip
+    desc_text  = (options[:desc]       || ENV["DESC"]).to_s.strip
+    UI.user_error!("PRODUCT_ID, LOCALE, DISPLAY and DESC are required") if [product_id, locale, display, desc_text].any?(&:empty?)
+    UI.user_error!("IAP display name over 30 chars (#{display.length})") if display.length > 30
+    UI.user_error!("IAP description over 45 chars (#{desc_text.length})") if desc_text.length > 45
+
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    iap = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?filter[productId]=#{product_id}")["data"].first
+    UI.user_error!("#{product_id} does not exist; run create_iap first") if iap.nil?
+    locs = asc_http(:get, "/v2/inAppPurchases/#{iap['id']}/inAppPurchaseLocalizations?limit=20")["data"]
+    if locs.any? { |l| l.dig("attributes", "locale") == locale }
+      UI.important("#{locale} localization already present; leaving it alone")
+      next
+    end
+    asc_http(:post, "/v1/inAppPurchaseLocalizations", {
+      "data" => { "type" => "inAppPurchaseLocalizations",
+                  "attributes" => { "locale" => locale, "name" => display, "description" => desc_text },
+                  "relationships" => { "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
+    })
+    UI.success("#{product_id} localized for #{locale}: #{display}")
+  end
+
+  desc "Upload the review screenshot for an IAP: PRODUCT_ID + FILE (png)."
+  # The screenshot is the one piece create_iap cannot do, and its absence is
+  # what keeps a product in MISSING_METADATA where submit_iaps must refuse it.
+  # Apple's asset upload is a three-step dance: reserve (returns chunked upload
+  # operations), PUT the bytes, then commit with a checksum.
+  lane :iap_review_shot do |options|
+    require "digest"
+    product_id = (options[:product_id] || ENV["PRODUCT_ID"]).to_s.strip
+    file       = File.expand_path((options[:file] || ENV["FILE"]).to_s.strip)
+    UI.user_error!("PRODUCT_ID and FILE are required") if product_id.empty? || file.empty?
+    UI.user_error!("No file at #{file}") unless File.exist?(file)
+
+    connect!
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    iap = asc_http(:get, "/v1/apps/#{app.id}/inAppPurchasesV2?filter[productId]=#{product_id}")["data"].first
+    UI.user_error!("#{product_id} does not exist") if iap.nil?
+
+    existing = begin
+      asc_http(:get, "/v2/inAppPurchases/#{iap['id']}/appStoreReviewScreenshot")
+    rescue FastlaneCore::Interface::FastlaneError
+      nil
+    end
+    if existing && existing["data"]
+      state = existing["data"].dig("attributes", "assetDeliveryState", "state")
+      if state == "COMPLETE"
+        UI.important("Review screenshot already uploaded (COMPLETE); leaving it alone")
+        next
+      end
+      asc_http(:delete, "/v1/inAppPurchaseAppStoreReviewScreenshots/#{existing['data']['id']}")
+      UI.message("Removed stale screenshot in state #{state}")
+    end
+
+    bytes = File.binread(file)
+    reserved = asc_http(:post, "/v1/inAppPurchaseAppStoreReviewScreenshots", {
+      "data" => { "type" => "inAppPurchaseAppStoreReviewScreenshots",
+                  "attributes" => { "fileName" => File.basename(file), "fileSize" => bytes.bytesize },
+                  "relationships" => { "inAppPurchaseV2" => { "data" => { "type" => "inAppPurchases", "id" => iap["id"] } } } }
+    })
+    shot_id = reserved.dig("data", "id")
+    ops = reserved.dig("data", "attributes", "uploadOperations") || []
+    UI.user_error!("Reserve returned no upload operations") if ops.empty?
+
+    require "net/http"
+    ops.each do |op|
+      uri = URI(op["url"])
+      chunk = bytes[op["offset"], op["length"]]
+      req = Net::HTTP::Put.new(uri)
+      (op["requestHeaders"] || []).each { |h| req[h["name"]] = h["value"] }
+      req.body = chunk
+      res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+      UI.user_error!("Chunk upload failed: #{res.code}") unless res.code.to_i.between?(200, 299)
+    end
+
+    asc_http(:patch, "/v1/inAppPurchaseAppStoreReviewScreenshots/#{shot_id}", {
+      "data" => { "type" => "inAppPurchaseAppStoreReviewScreenshots", "id" => shot_id,
+                  "attributes" => { "uploaded" => true,
+                                    "sourceFileChecksum" => Digest::MD5.hexdigest(bytes) } }
+    })
+    UI.success("Review screenshot uploaded and committed for #{product_id}")
+  end
+
   lane :submit_iaps do
     connect!
     app = Spaceship::ConnectAPI::App.find(app_id)
