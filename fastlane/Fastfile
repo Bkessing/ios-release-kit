@@ -1323,6 +1323,51 @@ platform :ios do
     end
   end
 
+  desc "upload_shots for a specific locale: IRK_SHOTS_DIR + IRK_SHOTS_LOCALE."
+  # Same mechanics as upload_shots but targets any storefront localization
+  # (born 2026-10-03 for Lab Tycoon's RU set; upload_shots itself is pinned
+  # to en-US and predates localized listings). The localization must already
+  # exist on the editable version (push_metadata with that locale's metadata
+  # dir creates it).
+  lane :upload_shots_locale do
+    api_key
+    dir = irk("SHOTS_DIR")
+    locale_code = irk("SHOTS_LOCALE")
+    names = (ENV["IRK_SHOT_NAMES"] || "").split(",").map(&:strip).reject(&:empty?)
+    names = Dir.glob(File.join(dir, "*.png")).sort.map { |f| File.basename(f) } if names.empty?
+    UI.user_error!("No screenshots found in #{dir}") if names.empty?
+
+    targets = {
+      "APP_IPHONE_67" => [dir, "1290x2796"],
+      "APP_IPHONE_65" => [File.join(dir, "65"), "1284x2778"],
+    }
+
+    app = Spaceship::ConnectAPI::App.find(app_id)
+    v = app.get_edit_app_store_version or UI.user_error!("No editable version — run new_version first")
+    loc = v.get_app_store_version_localizations.find { |l| l.locale == locale_code }
+    UI.user_error!("no #{locale_code} localization on the editable version") if loc.nil?
+
+    targets.each do |display_type, (src, expected)|
+      files = names.map { |f| File.join(src, f) }
+      next UI.important("skipping #{display_type}: #{src} not present") unless files.all? { |f| File.exist?(f) }
+      files.each do |f|
+        w, h = File.binread(f, 8, 16).unpack("N2")
+        UI.user_error!("#{File.basename(f)} is #{w}x#{h}, expected #{expected} for #{display_type}") if "#{w}x#{h}" != expected
+      end
+      set = loc.get_app_screenshot_sets.find { |x| x.screenshot_display_type == display_type }
+      if set.nil?
+        set = Spaceship::ConnectAPI.post_app_screenshot_set(
+          app_store_version_localization_id: loc.id,
+          attributes: { screenshotDisplayType: display_type }
+        ).to_models.first
+      else
+        set.app_screenshots.each(&:delete!)
+      end
+      files.each { |f| set.upload_screenshot(path: f, wait_for_processing: true) }
+      UI.success("#{locale_code} #{display_type}: #{files.length} screenshots")
+    end
+  end
+
   desc "Pull the live ASC listing into fastlane/metadata/ as the source of truth."
   lane :pull_metadata do
     require "fileutils"
