@@ -1331,7 +1331,11 @@ platform :ios do
   # dir creates it).
   lane :upload_shots_locale do
     api_key
+    # fastlane executes from inside fastlane/, so a repo-root-relative
+    # SHOTS_DIR resolves to nothing (same trap as push_metadata). Accept
+    # absolute paths as-is; otherwise try the given path, then ../.
     dir = irk("SHOTS_DIR")
+    dir = ["#{dir}", File.join("..", dir)].find { |d| Dir.exist?(d) } || dir unless dir.start_with?("/")
     locale_code = irk("SHOTS_LOCALE")
     names = (ENV["IRK_SHOT_NAMES"] || "").split(",").map(&:strip).reject(&:empty?)
     names = Dir.glob(File.join(dir, "*.png")).sort.map { |f| File.basename(f) } if names.empty?
