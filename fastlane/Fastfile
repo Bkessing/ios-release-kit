@@ -232,6 +232,35 @@ def asc_http(method, path, body = nil)
   end
 end
 
+# Apple began requiring `socialMedia` and `socialMediaAgeRestricted` on the age
+# rating declaration in late Oct 2026. Until they are set, submission fails
+# with "not in valid state", reported against the version. Idempotent: patches
+# only when a field is missing (null). ASC_SOCIAL_MEDIA=true|false (default
+# false) says whether the app has social media features;
+# ASC_SOCIAL_MEDIA_AGE_RESTRICTED (default false) is the age-restriction flag.
+# Ref: fastlane/fastlane#30499. Lab Tycoon 1.0.6 went through this by hand.
+def ensure_age_rating_fields(app_id_value)
+  social = ENV.fetch("ASC_SOCIAL_MEDIA", "false").to_s.strip.downcase == "true"
+  restricted = ENV.fetch("ASC_SOCIAL_MEDIA_AGE_RESTRICTED", "false").to_s.strip.downcase == "true"
+  infos = asc_http(:get, "/v1/apps/#{app_id_value}/appInfos?limit=10")["data"]
+  # The editable appInfo is the one not yet live.
+  live_states = %w[READY_FOR_DISTRIBUTION READY_FOR_SALE]
+  info = infos.find { |i| !live_states.include?(i.dig("attributes", "appStoreState") || i.dig("attributes", "state")) } || infos.first
+  UI.user_error!("No appInfo found for age rating") if info.nil?
+  decl = asc_http(:get, "/v1/appInfos/#{info['id']}/ageRatingDeclaration")["data"]
+  attrs = decl["attributes"] || {}
+  want = { "socialMedia" => social, "socialMediaAgeRestricted" => restricted }
+  missing = want.select { |k, _| attrs[k].nil? }
+  if missing.empty?
+    UI.message("age rating already has socialMedia fields")
+    return
+  end
+  asc_http(:patch, "/v1/ageRatingDeclarations/#{decl['id']}", {
+    "data" => { "type" => "ageRatingDeclarations", "id" => decl["id"], "attributes" => missing }
+  })
+  UI.success("age rating: set #{missing.map { |k, v| "#{k}=#{v}" }.join(', ')}")
+end
+
 platform :ios do
 
   # -------------------------------------------------------------------------
@@ -533,23 +562,60 @@ platform :ios do
     UI.success("releaseType=#{rt} on #{v.version_string}")
   end
 
-  desc "Submit the editable version for review."
+  desc "Submit the editable version for review (version only; use submit_with_iaps for products)."
+  # deliver's submit_for_review uses POST /v1/appStoreVersionSubmissions, which
+  # Apple retired (now DELETE-only). Submit through reviewSubmissions instead,
+  # after making sure the age rating declaration has the required fields.
+  # Re-running converges: an unsubmitted submission is reused.
   lane :submit do
-    key = api_key
-    deliver(
-      api_key: key,
-      app_identifier: app_id,
-      submit_for_review: true,
-      automatic_release: false,
-      force: true,
-      skip_binary_upload: true,
-      skip_screenshots: true,
-      skip_metadata: true,
-      precheck_include_in_app_purchases: false
-    )
+    connect!
     app = Spaceship::ConnectAPI::App.find(app_id)
-    v = app.get_app_store_versions.first
-    UI.success("Submitted #{v&.version_string} — state #{v&.app_store_state}")
+    ensure_age_rating_fields(app.id)
+
+    version = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=10&filter[platform]=IOS")["data"]
+                .find { |v| %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED READY_FOR_REVIEW]
+                              .include?(v.dig("attributes", "appStoreState")) }
+    UI.user_error!("No editable version. Run new_version first.") if version.nil?
+
+    subs = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+    subs.select { |s| s.dig("attributes", "state") == "UNRESOLVED_ISSUES" }.each do |s|
+      asc_http(:patch, "/v1/reviewSubmissions/#{s['id']}", {
+        "data" => { "type" => "reviewSubmissions", "id" => s["id"], "attributes" => { "canceled" => true } } })
+      UI.important("cancelled stuck submission #{s['id']} (UNRESOLVED_ISSUES)")
+    end
+    sub = subs.find { |s| s.dig("attributes", "state") == "READY_FOR_REVIEW" } ||
+          asc_http(:post, "/v1/reviewSubmissions", {
+            "data" => { "type" => "reviewSubmissions", "attributes" => { "platform" => "IOS" },
+                        "relationships" => { "app" => { "data" => { "type" => "apps", "id" => app.id.to_s } } } }
+          })["data"]
+
+    already = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}/items?limit=50")["data"]
+    if already.any? { |it| it.dig("relationships", "appStoreVersion", "data") }
+      UI.message("version already attached")
+    else
+      attached = false
+      6.times do |i|
+        begin
+          asc_http(:post, "/v1/reviewSubmissionItems", {
+            "data" => { "type" => "reviewSubmissionItems", "relationships" => {
+              "reviewSubmission" => { "data" => { "type" => "reviewSubmissions", "id" => sub["id"] } },
+              "appStoreVersion" => { "data" => { "type" => "appStoreVersions", "id" => version["id"] } } } }
+          })
+          attached = true
+          break
+        rescue FastlaneCore::Interface::FastlaneError
+          UI.message("  version not free yet, retrying (#{i + 1}/6)")
+          sleep(10)
+        end
+      end
+      UI.user_error!("Version never came free.") unless attached
+    end
+
+    asc_http(:patch, "/v1/reviewSubmissions/#{sub['id']}",
+             { "data" => { "type" => "reviewSubmissions", "id" => sub["id"],
+                           "attributes" => { "submitted" => true } } })
+    state = asc_http(:get, "/v1/reviewSubmissions/#{sub['id']}").dig("data", "attributes", "state")
+    UI.success("Submitted #{version.dig('attributes', 'versionString')} - submission state #{state}")
   end
 
   desc "Cancel a stuck submission and resubmit with a fresh build. BUILD=<build number>"
@@ -833,6 +899,8 @@ platform :ios do
       UI.important("DRY=1 — would submit the version plus #{iaps.count} product(s)")
       next
     end
+
+    ensure_age_rating_fields(app.id)
 
     # A rejection leaves the old submission in UNRESOLVED_ISSUES, still
     # holding the version. Nothing can attach that version anywhere while it

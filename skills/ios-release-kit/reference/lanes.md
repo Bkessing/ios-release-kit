@@ -46,7 +46,7 @@ set, and exports with manual signing when `IRK_EXPORT_PROFILE` names a profile.
 | `new_version` | `VERSION=` `WHATS_NEW=` | Creates or reuses an editable version. |
 | `attach_build` | `BUILD=` | Attaches an uploaded build to the editable version. |
 | `set_release_type` | `RELEASE_TYPE=` | `AFTER_APPROVAL` (default), `MANUAL`, or `SCHEDULED`. |
-| `submit` | — | Submits for review. **Outward-facing: confirm first.** |
+| `submit` | — | Submits for review via reviewSubmissions, after setting the age-rating `socialMedia` fields if missing (env `ASC_SOCIAL_MEDIA=true|false`, default false). **Outward-facing: confirm first.** |
 | `resubmit` | `BUILD=` | Cancels a stuck submission and reattaches. Retries, because cancelling does not free the version immediately. |
 
 ## Metadata and assets
