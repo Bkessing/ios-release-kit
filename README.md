@@ -145,7 +145,7 @@ surfacing later as a confusing Apple error.
 | `new_version` | create or reuse an editable version, set What's New |
 | `attach_build` | attach an uploaded build to it |
 | `set_release_type` | `AFTER_APPROVAL`, `MANUAL` or `SCHEDULED` |
-| `submit` | submit for review |
+| `submit` | submit for review (sets required age-rating socialMedia fields; `ASC_SOCIAL_MEDIA`) |
 | `resubmit` | cancel a submission stuck in the review QUEUE, reattach |
 | `resubmit_rejected` | unstick a REJECTED version whose old submission never resolved |
 
