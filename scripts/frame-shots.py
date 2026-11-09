@@ -54,14 +54,17 @@ def frame(raw, out_path, size, bg, accent, headline, scale=1.0):
     inset_top = int(H * 0.055)
     if headline:
         f = font(int(W * 0.062 * scale))
-        words, lines, line = headline.split(), [], ""
-        for w in words:
-            probe = (line + " " + w).strip()
-            if draw.textlength(probe, font=f) > W * 0.86 and line:
-                lines.append(line); line = w
-            else:
-                line = probe
-        lines.append(line)
+        # " / " in a caption forces a line break; each part still wraps.
+        lines = []
+        for part in headline.split(" / "):
+            line = ""
+            for w in part.split():
+                probe = (line + " " + w).strip()
+                if draw.textlength(probe, font=f) > W * 0.86 and line:
+                    lines.append(line); line = w
+                else:
+                    line = probe
+            lines.append(line)
         y = inset_top
         for ln in lines:
             tw = draw.textlength(ln, font=f)
