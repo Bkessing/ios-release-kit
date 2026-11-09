@@ -39,7 +39,7 @@ def font(size):
     return ImageFont.load_default()
 
 
-def frame(raw, out_path, size, bg, accent, headline):
+def frame(raw, out_path, size, bg, accent, headline, scale=1.0):
     W, H = size
     canvas = Image.new("RGB", (W, H), bg)
     draw = ImageDraw.Draw(canvas)
@@ -53,7 +53,7 @@ def frame(raw, out_path, size, bg, accent, headline):
     # headline block
     inset_top = int(H * 0.055)
     if headline:
-        f = font(int(W * 0.062))
+        f = font(int(W * 0.062 * scale))
         words, lines, line = headline.split(), [], ""
         for w in words:
             probe = (line + " " + w).strip()
@@ -66,7 +66,7 @@ def frame(raw, out_path, size, bg, accent, headline):
         for ln in lines:
             tw = draw.textlength(ln, font=f)
             draw.text(((W - tw) / 2, y), ln, font=f, fill=(240, 236, 228))
-            y += int(W * 0.075)
+            y += int(W * 0.075 * scale)
         # accent underline, sized to the last line
         tw = draw.textlength(lines[-1], font=f)
         draw.rectangle([(W - tw) / 2, y + 6, (W + tw) / 2, y + 12], fill=accent)
@@ -102,6 +102,8 @@ def main():
     ap.add_argument("--size", default="1320x2868")
     ap.add_argument("--bg", default="0B0912")
     ap.add_argument("--accent", default="E8720C")
+    ap.add_argument("--headline-scale", type=float, default=1.0,
+                    help="multiply the headline size; App Store shots read best around 1.5")
     args = ap.parse_args()
 
     size = tuple(int(x) for x in args.size.lower().split("x"))
@@ -119,7 +121,7 @@ def main():
     if not pngs:
         sys.exit(f"no PNGs in {raw_dir}")
     for p in pngs:
-        frame(p, out_dir / p.name, size, bg, accent, captions.get(p.stem, ""))
+        frame(p, out_dir / p.name, size, bg, accent, captions.get(p.stem, ""), args.headline_scale)
         print(f"framed {p.name}")
 
 
