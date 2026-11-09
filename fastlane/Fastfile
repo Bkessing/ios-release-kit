@@ -603,8 +603,8 @@ platform :ios do
           })
           attached = true
           break
-        rescue FastlaneCore::Interface::FastlaneError
-          UI.message("  version not free yet, retrying (#{i + 1}/6)")
+        rescue FastlaneCore::Interface::FastlaneError => e
+          UI.message("  version not free yet, retrying (#{i + 1}/6): #{e.message.to_s[0, 300]}")
           sleep(10)
         end
       end
@@ -953,8 +953,8 @@ platform :ios do
           })
           attached = true
           break
-        rescue FastlaneCore::Interface::FastlaneError
-          UI.message("  version not free yet, retrying (#{i + 1}/6)")
+        rescue FastlaneCore::Interface::FastlaneError => e
+          UI.message("  version not free yet, retrying (#{i + 1}/6): #{e.message.to_s[0, 300]}")
           sleep(10)
         end
       end
