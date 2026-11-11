@@ -239,7 +239,7 @@ end
 # false) says whether the app has social media features;
 # ASC_SOCIAL_MEDIA_AGE_RESTRICTED (default false) is the age-restriction flag.
 # Ref: fastlane/fastlane#30499. Lab Tycoon 1.0.6 went through this by hand.
-def ensure_age_rating_fields(app_id_value)
+def ensure_age_rating_fields(app_id_value, dry: false)
   social = ENV.fetch("ASC_SOCIAL_MEDIA", "false").to_s.strip.downcase == "true"
   restricted = ENV.fetch("ASC_SOCIAL_MEDIA_AGE_RESTRICTED", "false").to_s.strip.downcase == "true"
   infos = asc_http(:get, "/v1/apps/#{app_id_value}/appInfos?limit=10")["data"]
@@ -253,6 +253,10 @@ def ensure_age_rating_fields(app_id_value)
   missing = want.select { |k, _| attrs[k].nil? }
   if missing.empty?
     UI.message("age rating already has socialMedia fields")
+    return
+  end
+  if dry
+    UI.important("DRY=1 — would set age rating #{missing.map { |k, v| "#{k}=#{v}" }.join(', ')}")
     return
   end
   asc_http(:patch, "/v1/ageRatingDeclarations/#{decl['id']}", {
@@ -562,7 +566,7 @@ platform :ios do
     UI.success("releaseType=#{rt} on #{v.version_string}")
   end
 
-  desc "Submit the editable version for review (version only; use submit_with_iaps for products)."
+  desc "Submit the editable version for review (version only; use submit_with_iaps for products). DRY=1 to preview."
   # deliver's submit_for_review uses POST /v1/appStoreVersionSubmissions, which
   # Apple retired (now DELETE-only). Submit through reviewSubmissions instead,
   # after making sure the age rating declaration has the required fields.
@@ -570,12 +574,23 @@ platform :ios do
   lane :submit do
     connect!
     app = Spaceship::ConnectAPI::App.find(app_id)
-    ensure_age_rating_fields(app.id)
+    dry = !ENV["DRY"].to_s.empty?
 
+    # Check for a version first: running before new_version should fail with
+    # this message, not a raw 409/423 from the age rating PATCH below.
     version = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=10&filter[platform]=IOS")["data"]
                 .find { |v| %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED READY_FOR_REVIEW]
                               .include?(v.dig("attributes", "appStoreState")) }
     UI.user_error!("No editable version. Run new_version first.") if version.nil?
+
+    ensure_age_rating_fields(app.id, dry: dry)
+    if dry
+      stuck = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
+                .count { |s| s.dig("attributes", "state") == "UNRESOLVED_ISSUES" }
+      UI.important("DRY=1 — would cancel #{stuck} stuck submission(s) and submit " \
+                   "#{version.dig('attributes', 'versionString')} (#{version.dig('attributes', 'appStoreState')})")
+      next
+    end
 
     subs = asc_http(:get, "/v1/reviewSubmissions?filter[app]=#{app.id}&filter[platform]=IOS&limit=20")["data"]
     subs.select { |s| s.dig("attributes", "state") == "UNRESOLVED_ISSUES" }.each do |s|
