@@ -112,6 +112,7 @@ build attached. A name and subtitle sharing a word is a warning. With `DRY=1`
 |---|---|
 | `APPSTORE_DOCTOR` | Full command, e.g. `appstore-doctor` |
 | `APPSTORE_DOCTOR_DIR` | A clone of Bkessing/appstore-doctor (run with `python3 -m`, needs `cryptography`) |
+| `APPSTORE_DOCTOR_PROJECT` | The app folder the gate reads for the privacy manifest against the events the code sends. Default: the folder above `fastlane/`. `none` leaves that line out |
 | `SKIP_DOCTOR=1` | Skip the gate. For a doctor bug blocking a good submit only; report that it was skipped |
 
 With neither set, `appstore-doctor` must be on PATH or the lane refuses to submit.

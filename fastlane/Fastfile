@@ -268,6 +268,17 @@ def doctor_command
   on_path ? [["appstore-doctor"], {}] : nil
 end
 
+# The app's source folder, so the gate can hold the privacy manifest against the
+# events the code sends. Ruby in a Fastfile runs inside ./fastlane, so step up
+# from it. APPSTORE_DOCTOR_PROJECT overrides; "none" leaves the line out.
+def doctor_project_dir
+  override = ENV["APPSTORE_DOCTOR_PROJECT"].to_s.strip
+  return nil if override == "none"
+  return File.expand_path(override) unless override.empty?
+  here = Dir.pwd
+  File.basename(here) == "fastlane" ? File.dirname(here) : here
+end
+
 def presubmit_check!(asc_app_id, with_iaps: false, dry: false)
   if ENV["SKIP_DOCTOR"].to_s.strip == "1"
     UI.important("SKIP_DOCTOR=1: the appstore-doctor pre-submit gate was SKIPPED for this submit")
@@ -286,6 +297,8 @@ def presubmit_check!(asc_app_id, with_iaps: false, dry: false)
   require "open3"
   args = cmd + ["--app-id", asc_app_id.to_s, "--presubmit", "--json", "--no-color"]
   args << "--with-iaps" if with_iaps
+  project_dir = doctor_project_dir
+  args += ["--project", project_dir] if project_dir
   env = env.merge("ASC_KEY_ID" => ENV.fetch("ASC_KEY_ID"), "ASC_ISSUER_ID" => ENV.fetch("ASC_ISSUER_ID"),
                   "ASC_KEY_FILEPATH" => key_path)
   UI.message("pre-submit gate: #{args.join(' ')}")
