@@ -46,7 +46,7 @@ set, and exports with manual signing when `IRK_EXPORT_PROFILE` names a profile.
 | `new_version` | `VERSION=` `WHATS_NEW=` | Creates or reuses an editable version. |
 | `attach_build` | `BUILD=` | Attaches an uploaded build to the editable version. |
 | `set_release_type` | `RELEASE_TYPE=` | `AFTER_APPROVAL` (default), `MANUAL`, or `SCHEDULED`. |
-| `submit` | — | Submits for review via reviewSubmissions, after setting the age-rating `socialMedia` fields if missing (env `ASC_SOCIAL_MEDIA=true|false`, default false). **Outward-facing: confirm first.** |
+| `submit` | — | Runs the appstore-doctor pre-submit gate (below), then submits for review via reviewSubmissions, after setting the age-rating `socialMedia` fields if missing (env `ASC_SOCIAL_MEDIA=true|false`, default false; the gate fails first if they are unanswered, so the default is never applied silently). **Outward-facing: confirm first.** |
 | `resubmit` | `BUILD=` | Cancels a stuck submission and reattaches. Retries, because cancelling does not free the version immediately. |
 
 ## Metadata and assets
@@ -97,3 +97,21 @@ These are guards, not bugs. When one fires, the message is the answer.
 - `stage` refuses without `IRK_CONTACT_PHONE`. Apple requires a review contact
   phone number and there is no sensible default.
 - Any missing `IRK_*` variable fails with the exact line to add to the Fastfile.
+
+## Pre-submit gate
+
+`submit`, `submit_with_iaps` and `resubmit_rejected` run
+`appstore-doctor --presubmit` before anything is submitted, and stop on a FAIL
+with every fix listed at once: a first-of-its-kind product left out of the
+submission, an agreement or contract error, an unanswered age-rating question,
+a locale with no privacy policy URL, a required screenshot size missing, no
+build attached. A name and subtitle sharing a word is a warning. With `DRY=1`
+(`submit_with_iaps`) the result is printed and the lane does not stop.
+
+| Env | Meaning |
+|---|---|
+| `APPSTORE_DOCTOR` | Full command, e.g. `appstore-doctor` |
+| `APPSTORE_DOCTOR_DIR` | A clone of Bkessing/appstore-doctor (run with `python3 -m`, needs `cryptography`) |
+| `SKIP_DOCTOR=1` | Skip the gate. For a doctor bug blocking a good submit only; report that it was skipped |
+
+With neither set, `appstore-doctor` must be on PATH or the lane refuses to submit.

@@ -219,6 +219,13 @@ def asc_http(method, path, body = nil)
   req.body = JSON.generate(body) if body
   res = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
   unless res.code.to_i.between?(200, 299)
+    # The agreement codes name the real fix; the bare error reads like a
+    # product or submission problem. Only the Account Holder can accept one.
+    if res.body.to_s =~ /MISSING_VALID_CONTRACT|REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED/
+      UI.user_error!("ASC #{method.to_s.upcase} #{path} -> #{res.code}: an Apple agreement is not active.\n" \
+                     "Open App Store Connect > Business and accept the pending agreement (the Paid\n" \
+                     "Applications Agreement for anything that sells). Only the Account Holder can.\n#{res.body}")
+    end
     UI.user_error!("ASC #{method.to_s.upcase} #{path} -> #{res.code}\n#{res.body}")
   end
   # Not every ASC endpoint answers JSON -- offer-code values come back as CSV --
@@ -229,6 +236,85 @@ def asc_http(method, path, body = nil)
     JSON.parse(res.body)
   rescue JSON::ParserError
     res.body
+  end
+end
+
+# Pre-submit gate. Runs `appstore-doctor --presubmit` (read-only) against the
+# app and refuses to submit when it reports a FAIL, listing every fix at once.
+# On 2026-11-18 two submits failed one Apple error at a time: privacy URLs
+# missing in six locales, an unanswered age-rating question (socialMedia), a
+# first non-consumable left out of the submission, and an inactive Paid
+# Applications Agreement. Each one was readable before submitting.
+#
+# Where the doctor comes from, first match wins:
+#   APPSTORE_DOCTOR="<command>"      e.g. "appstore-doctor" or "python3 -m appstore_doctor"
+#   APPSTORE_DOCTOR_DIR=<checkout>   a clone of Bkessing/appstore-doctor
+#   `appstore-doctor` on PATH
+# SKIP_DOCTOR=1 skips the gate and says so loudly. It exists for a doctor bug
+# that blocks a good submit, not for a red result you disagree with.
+# In DRY runs the result is printed but does not stop the lane.
+def doctor_command
+  if !ENV["APPSTORE_DOCTOR"].to_s.strip.empty?
+    require "shellwords"
+    return [Shellwords.split(ENV["APPSTORE_DOCTOR"]), {}]
+  end
+  dir = ENV["APPSTORE_DOCTOR_DIR"].to_s.strip
+  unless dir.empty?
+    dir = File.expand_path(dir)
+    UI.user_error!("APPSTORE_DOCTOR_DIR=#{dir} has no appstore_doctor package") unless File.directory?(File.join(dir, "appstore_doctor"))
+    return [%w[python3 -m appstore_doctor], { "PYTHONPATH" => dir }]
+  end
+  on_path = ENV["PATH"].to_s.split(File::PATH_SEPARATOR).any? { |d| File.executable?(File.join(d, "appstore-doctor")) }
+  on_path ? [["appstore-doctor"], {}] : nil
+end
+
+def presubmit_check!(asc_app_id, with_iaps: false, dry: false)
+  if ENV["SKIP_DOCTOR"].to_s.strip == "1"
+    UI.important("SKIP_DOCTOR=1: the appstore-doctor pre-submit gate was SKIPPED for this submit")
+    return
+  end
+  cmd, env = doctor_command
+  if cmd.nil?
+    UI.user_error!(
+      "appstore-doctor not found, so the pre-submit gate cannot run.\n" \
+      "Clone Bkessing/appstore-doctor and set APPSTORE_DOCTOR_DIR to it (needs the\n" \
+      "`cryptography` package), or install it so `appstore-doctor` is on PATH.\n" \
+      "SKIP_DOCTOR=1 bypasses the gate; say why wherever you report the submit."
+    )
+  end
+  require "json"
+  require "open3"
+  args = cmd + ["--app-id", asc_app_id.to_s, "--presubmit", "--json", "--no-color"]
+  args << "--with-iaps" if with_iaps
+  env = env.merge("ASC_KEY_ID" => ENV.fetch("ASC_KEY_ID"), "ASC_ISSUER_ID" => ENV.fetch("ASC_ISSUER_ID"),
+                  "ASC_KEY_FILEPATH" => key_path)
+  UI.message("pre-submit gate: #{args.join(' ')}")
+  out, err, status = Open3.capture3(env, *args)
+  begin
+    report = JSON.parse(out)
+  rescue JSON::ParserError
+    UI.user_error!("appstore-doctor did not return JSON (exit #{status.exitstatus}):\n#{(err.to_s + out.to_s)[0, 1500]}")
+  end
+  findings = report["findings"] || []
+  fails = findings.select { |f| f["status"] == "fail" }
+  warns = findings.select { |f| f["status"] == "warn" }
+  warns.each do |f|
+    UI.important("  WARN #{f['check']}: #{f['summary']}")
+    f["detail"].to_s.each_line { |l| UI.important("         #{l.rstrip}") } unless f["detail"].to_s.empty?
+  end
+  if fails.empty?
+    UI.success("pre-submit gate: no blocking issues (#{warns.count} warning(s))")
+    return
+  end
+  fails.each do |f|
+    UI.error("  FAIL #{f['check']}: #{f['summary']}")
+    f["detail"].to_s.each_line { |l| UI.error("         #{l.rstrip}") } unless f["detail"].to_s.empty?
+    f["fix"].to_s.each_line { |l| UI.error("    fix: #{l.rstrip}") } unless f["fix"].to_s.empty?
+  end
+  if dry
+    UI.important("DRY=1: a real run would STOP here (#{fails.count} blocking issue(s))")
+  else
+    UI.user_error!("pre-submit gate: #{fails.count} blocking issue(s) above. Nothing was submitted.")
   end
 end
 
@@ -570,6 +656,9 @@ platform :ios do
   lane :submit do
     connect!
     app = Spaceship::ConnectAPI::App.find(app_id)
+    # Gate first: an unanswered age-rating question must stop the submit, not
+    # be filled in by ensure_age_rating_fields' defaults.
+    presubmit_check!(app.id)
     ensure_age_rating_fields(app.id)
 
     version = asc_http(:get, "/v1/apps/#{app.id}/appStoreVersions?limit=10&filter[platform]=IOS")["data"]
@@ -708,6 +797,7 @@ platform :ios do
       next
     end
     UI.important("#{stuck.count} stuck submission(s) holding the version")
+    presubmit_check!(app.id)
 
     # Create the replacement FIRST. If cancelling fails halfway there is still
     # somewhere to attach the version, rather than a version owned by nothing.
@@ -894,6 +984,8 @@ platform :ios do
     skip = iaps.select { |i| i.dig("attributes", "state") == "MISSING_METADATA" }
     skip.each { |i| UI.important("skipping #{i.dig('attributes', 'productId')} — MISSING_METADATA would sink the version with it") }
     iaps -= skip
+
+    presubmit_check!(app.id, with_iaps: true, dry: dry)
 
     if dry
       UI.important("DRY=1 — would submit the version plus #{iaps.count} product(s)")
