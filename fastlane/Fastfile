@@ -331,36 +331,15 @@ platform :ios do
   #   - betaTester records are APP-scoped. The contact's tester record from
   #     another app cannot be linked into this app's group (409 STATE_ERROR).
   #   - The path that works is creating the tester WITH the group
-  #     relationship in one call, which create_beta_tester does.
+  #     relationship in one call (setup_internal posts it that way).
   # Idempotent: safe to run on every app, before or after the first upload.
+  # Broke on fastlane 2.236 (2026-11-21, Dreadnook's first upload):
+  # create_beta_group no longer takes app:, its app_id: form sends
+  # publicLinkLimitEnabled which internal groups reject, and create_beta_tester
+  # is gone. setup_internal does the same job with raw POSTs, so this name
+  # stays only as an alias for older runbooks.
   lane :ensure_internal_group do
-    connect!
-    app = Spaceship::ConnectAPI::App.find(app_id)
-    UI.user_error!("No app record for #{app_id} — create it in ASC first (create_app prints the steps)") unless app
-
-    group = Spaceship::ConnectAPI.get_beta_groups(filter: { app: app.id })
-                                 .find(&:is_internal_group)
-    if group.nil?
-      group = Spaceship::ConnectAPI.create_beta_group(
-        app: app, group_name: "Internal Testers",
-        is_internal_group: true, has_access_to_all_builds: true
-      )
-      UI.success("Created internal group 'Internal Testers' (all builds)")
-    else
-      UI.message("Internal group exists: #{group.name}")
-    end
-
-    email = irk("CONTACT_EMAIL")
-    existing = Spaceship::ConnectAPI.get_beta_testers(filter: { betaGroups: group.id, email: email })
-    if existing.any?
-      UI.message("#{email} already in the group")
-    else
-      Spaceship::ConnectAPI.create_beta_tester(
-        beta_group_ids: [group.id], email: email,
-        first_name: irk("CONTACT_FIRST"), last_name: irk("CONTACT_LAST")
-      )
-      UI.success("Added #{email} to Internal Testers")
-    end
+    setup_internal
   end
 
   desc "Create the Apple Distribution certificate if the account has none."
